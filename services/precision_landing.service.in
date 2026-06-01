@@ -1,0 +1,40 @@
+# =============================================================================
+# precision_landing.service.in – systemd unit template
+#
+# Install:
+#   envsubst < services/precision_landing.service.in \
+#       > /etc/systemd/system/precision_landing.service
+#   systemctl daemon-reload && systemctl enable precision_landing
+#
+# Required environment variables (set before envsubst):
+#   USER_NAME       – Linux user running the service
+#   ROS_DISTRO      – e.g. "jazzy"
+#   WS_DIR          – workspace install path (contains install/)
+#   XRCE_PORT       – Micro-XRCE-DDS UDP port (default 8888)
+# =============================================================================
+[Unit]
+Description=Precision Landing (ROS 2)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${USER_NAME}
+
+# ── Environment ─────────────────────────────────────────────────────────────
+Environment="ROS_DOMAIN_ID=0"
+Environment="RMW_IMPLEMENTATION=rmw_fastrtps_cpp"
+Environment="ROS_LOCALHOST_ONLY=0"
+
+ExecStart=/bin/bash -lc '\
+  source /opt/ros/${ROS_DISTRO}/setup.bash && \
+  source ${WS_DIR}/install/setup.bash && \
+  ros2 launch precision_landing system.launch.py'
+
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
