@@ -8,3 +8,12 @@
 	url = https://github.com/Auterion/px4-ros2-interface-lib.git
 	branch = release/1.17
 
+[submodule "src/external/vision_opencv"]
+	path = src/external/vision_opencv
+	url = https://github.com/ros-perception/vision_opencv.git
+	branch = 4.1.0
+
+[submodule "src/external/camera_ros"]
+	path = src/external/camera_ros
+	url = https://github.com/christianrauch/camera_ros.git
+	branch = 0.6.0
