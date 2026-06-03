@@ -7,8 +7,9 @@ What it does:
 - polls backend mission and vehicle status
 - builds MissionExecutor JSON missions
 - saves missions through the backend
-- triggers activation through a separate action
-- supports one-click `Save + Run` for testing
+- starts missions through `/adaptive_mission_mode/start`
+- supports one-click `Save + Start` for testing
+- sends return-home/pause through `/adaptive_mission_mode/return_home`
 
 ## Run
 

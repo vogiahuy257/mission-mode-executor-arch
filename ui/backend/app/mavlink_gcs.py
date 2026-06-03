@@ -32,6 +32,12 @@ class MavlinkTelemetryCache:
     longitude_deg: float | None = None
     relative_altitude_m: float | None = None
     altitude_amsl_m: float | None = None
+    global_origin_lat_deg: float | None = None
+    global_origin_lon_deg: float | None = None
+    global_origin_alt_msl_m: float | None = None
+    local_x_ned_m: float | None = None
+    local_y_ned_m: float | None = None
+    local_z_ned_m: float | None = None
     heading_deg: float | None = None
     yaw_deg: float | None = None
     roll_deg: float | None = None
@@ -57,6 +63,14 @@ def _rad_to_deg(value: float) -> float:
 
 def _yaw_to_heading_deg(yaw_rad: float) -> float:
     return (_rad_to_deg(yaw_rad) + 360.0) % 360.0
+
+
+def _lat_lon_to_ned(ref_lat_deg: float, ref_lon_deg: float, latitude_deg: float, longitude_deg: float) -> tuple[float, float]:
+    earth_radius_m = 6378137.0
+    ref_lat_rad = math.radians(ref_lat_deg)
+    north_m = math.radians(latitude_deg - ref_lat_deg) * earth_radius_m
+    east_m = math.radians(longitude_deg - ref_lon_deg) * earth_radius_m * max(math.cos(ref_lat_rad), 1e-7)
+    return north_m, east_m
 
 
 PX4_CUSTOM_MAIN_MODE_MANUAL = 1
@@ -163,6 +177,12 @@ class MavlinkGcsBridge:
                 longitude_deg=self._cache.longitude_deg,
                 relative_altitude_m=self._cache.relative_altitude_m,
                 altitude_amsl_m=self._cache.altitude_amsl_m,
+                global_origin_lat_deg=self._cache.global_origin_lat_deg,
+                global_origin_lon_deg=self._cache.global_origin_lon_deg,
+                global_origin_alt_msl_m=self._cache.global_origin_alt_msl_m,
+                local_x_ned_m=self._cache.local_x_ned_m,
+                local_y_ned_m=self._cache.local_y_ned_m,
+                local_z_ned_m=self._cache.local_z_ned_m,
                 heading_deg=self._cache.heading_deg,
                 yaw_deg=self._cache.yaw_deg,
                 roll_deg=self._cache.roll_deg,
@@ -277,9 +297,10 @@ class MavlinkGcsBridge:
 
             with self._lock:
                 heartbeat_age = _age_seconds(self._last_heartbeat_time)
+                message_age = _age_seconds(self._last_message_time)
                 self._cache.connected = bool(
-                    heartbeat_age is not None
-                    and heartbeat_age <= self._settings.mavlink_timeout_s
+                    (heartbeat_age is not None and heartbeat_age <= self._settings.mavlink_timeout_s)
+                    or (message_age is not None and message_age <= self._settings.mavlink_timeout_s)
                 )
 
             time.sleep(0.01)
@@ -375,13 +396,44 @@ class MavlinkGcsBridge:
             heading = None
             if hasattr(message, "hdg") and int(message.hdg) != 65535:
                 heading = float(message.hdg) / 100.0
+            latitude_deg = float(message.lat) / 1e7
+            longitude_deg = float(message.lon) / 1e7
+            altitude_amsl_m = float(message.alt) / 1000.0
+            relative_altitude_m = float(message.relative_alt) / 1000.0
             with self._lock:
-                self._cache.latitude_deg = float(message.lat) / 1e7
-                self._cache.longitude_deg = float(message.lon) / 1e7
-                self._cache.altitude_amsl_m = float(message.alt) / 1000.0
-                self._cache.relative_altitude_m = float(message.relative_alt) / 1000.0
+                self._cache.latitude_deg = latitude_deg
+                self._cache.longitude_deg = longitude_deg
+                self._cache.altitude_amsl_m = altitude_amsl_m
+                self._cache.relative_altitude_m = relative_altitude_m
+
+                # Derive local NED from global if LOCAL_POSITION_NED is missing or
+                # not routed to this UDP endpoint. This makes the UI usable even
+                # when MAVLink local-position streaming is unavailable.
+                if self._cache.global_origin_lat_deg is None:
+                    self._cache.global_origin_lat_deg = latitude_deg
+                    self._cache.global_origin_lon_deg = longitude_deg
+                    self._cache.global_origin_alt_msl_m = altitude_amsl_m
+                if self._cache.global_origin_lat_deg is not None and self._cache.global_origin_lon_deg is not None:
+                    local_x, local_y = _lat_lon_to_ned(
+                        self._cache.global_origin_lat_deg,
+                        self._cache.global_origin_lon_deg,
+                        latitude_deg,
+                        longitude_deg,
+                    )
+                    self._cache.local_x_ned_m = local_x
+                    self._cache.local_y_ned_m = local_y
+                if self._cache.global_origin_alt_msl_m is not None:
+                    self._cache.local_z_ned_m = -(altitude_amsl_m - self._cache.global_origin_alt_msl_m)
+
                 if heading is not None:
                     self._cache.heading_deg = heading
+            return
+
+        if message_type == "LOCAL_POSITION_NED":
+            with self._lock:
+                self._cache.local_x_ned_m = float(message.x)
+                self._cache.local_y_ned_m = float(message.y)
+                self._cache.local_z_ned_m = float(message.z)
             return
 
         if message_type == "ATTITUDE":
@@ -454,6 +506,22 @@ class MavlinkGcsBridge:
                 with self._lock:
                     self._cache.last_error = f"Failed to request MAVLink message interval: {exc}"
                 break
+
+        # Compatibility fallback for links/autopilots that still honor the old
+        # REQUEST_DATA_STREAM API more reliably than SET_MESSAGE_INTERVAL.
+        try:
+            with self._mav_io_lock:
+                self._mav.mav.request_data_stream_send(
+                    self._target_system,
+                    self._target_component,
+                    mavutil.mavlink.MAV_DATA_STREAM_ALL,
+                    10,
+                    1,
+                )
+        except Exception:
+            # SET_MESSAGE_INTERVAL above is the primary request path, so keep this
+            # fallback silent unless the primary path itself fails.
+            pass
 
         self._last_stream_request_time = now
 

@@ -301,14 +301,10 @@ class RosMissionBridge:
             pickup_raw = self._cache.pickup_raw
             pickup_age = _age_seconds(self._cache.pickup_time)
             pickup_at = self._cache.pickup_at
-            mission_block = mission_runtime.get("mission") if isinstance(mission_runtime.get("mission"), dict) else {}
-            runtime_items = mission_block.get("items") if isinstance(mission_block.get("items"), list) else []
-            runtime_item_count = _optional_int(mission_block.get("item_count")) or len(runtime_items)
-            runtime_mission_loaded = _optional_bool(mission_runtime.get("mission_loaded"))
             mission_cache = MissionCacheSnapshot(
-                loaded=bool(runtime_mission_loaded) or self._cache.item_count > 0,
+                loaded=self._cache.item_count > 0,
                 mission_name=self._cache.mission_name,
-                item_count=self._cache.item_count or runtime_item_count,
+                item_count=self._cache.item_count,
                 last_mission_publish_at=self._cache.last_mission_publish_at,
                 last_activate_publish_at=self._cache.last_activate_publish_at,
                 last_abort_publish_at=self._cache.last_abort_publish_at,
@@ -329,41 +325,6 @@ class RosMissionBridge:
         if battery is not None and battery.remaining >= 0:
             battery_percent = max(0, min(100, int(round(battery.remaining * 100))))
 
-        mission_block = mission_runtime.get("mission") if isinstance(mission_runtime.get("mission"), dict) else {}
-        current_item = mission_block.get("current_item") if isinstance(mission_block.get("current_item"), dict) else None
-        current_target = current_item.get("target") if isinstance(current_item, dict) and isinstance(current_item.get("target"), dict) else {}
-        mission_items = mission_block.get("items") if isinstance(mission_block.get("items"), list) else []
-        altitude_block = mission_runtime.get("altitude") if isinstance(mission_runtime.get("altitude"), dict) else {}
-        runtime_state = _optional_str(mission_runtime.get("state", mission_runtime.get("runtime_state")))
-        current_index = _optional_int(
-            mission_runtime.get("current_item_index", mission_runtime.get("current_index"))
-        )
-        if current_index is None:
-            current_index = _optional_int(mission_block.get("current_index"))
-        if current_index is None and isinstance(current_item, dict):
-            current_index = _optional_int(current_item.get("index"))
-        current_type = _optional_str(mission_runtime.get("current_item_type"))
-        if current_type is None and isinstance(current_item, dict):
-            current_type = _optional_str(current_item.get("type"))
-        current_id = _optional_str(current_item.get("id")) if isinstance(current_item, dict) else None
-        pause_payload = mission_runtime.get("pause") if isinstance(mission_runtime.get("pause"), dict) else {}
-        if runtime_state in {"pause_rtl", "landed_wait_continue", "resume_arm", "return_pause_point"}:
-            pause_payload = {**pause_payload, "phase": runtime_state, "paused": True}
-        mission_ready = _optional_bool(mission_runtime.get("mission_ready"))
-        mission_loaded = _optional_bool(mission_runtime.get("mission_loaded"))
-        mission_active = _optional_bool(mission_runtime.get("mission_active", mission_runtime.get("active")))
-        mission_starting = _optional_bool(mission_runtime.get("mission_start_in_progress", mission_runtime.get("starting")))
-        altitude_offset_m = _optional_float(altitude_block.get("offset_m"))
-        if altitude_offset_m is None:
-            altitude_offset_m = _optional_float(mission_runtime.get("altitude_offset_m"))
-        altitude_offset_active = _optional_bool(altitude_block.get("offset_active"))
-        if altitude_offset_active is None:
-            altitude_offset_active = _optional_bool(mission_runtime.get("manual_altitude_active"))
-        base_altitude_msl = _optional_float(current_target.get("z_msl"))
-        actual_target_altitude_msl = _optional_float(current_target.get("z_with_offset_msl"))
-        if actual_target_altitude_msl is None:
-            actual_target_altitude_msl = _optional_float(altitude_block.get("target_msl"))
-
         return StatusSnapshot(
             ros_ready=self._node is not None and self._thread is not None and self._thread.is_alive(),
             mission_topic=self._settings.mission_topic,
@@ -371,7 +332,6 @@ class RosMissionBridge:
             pickup_topic=self._settings.pickup_topic,
             pause_rtl_topic=self._settings.pause_rtl_topic,
             continue_mission_topic=self._settings.continue_mission_topic,
-            mission_state_topic=self._settings.mission_status_topic,
             start_topic=self._settings.start_topic,
             return_home_topic=self._settings.return_home_topic,
             vehicle=VehicleSnapshot(
@@ -404,31 +364,20 @@ class RosMissionBridge:
             ),
             mission_runtime=MissionRuntimeSnapshot(
                 available=bool(mission_runtime),
-                runtime_state=runtime_state,
-                mission_loaded=mission_loaded,
-                mission_ready=mission_ready,
-                mission_active=mission_active,
-                mission_start_in_progress=mission_starting,
-                current_item_index=current_index,
-                current_item_type=current_type,
-                current_item_id=current_id,
-                current_item=current_item,
-                mission_items=mission_items,
-                mission_item_count=_optional_int(mission_block.get("item_count")) or len(mission_items),
+                runtime_state=_optional_str(mission_runtime.get("runtime_state")),
+                mission_ready=_optional_bool(mission_runtime.get("mission_ready")),
+                mission_active=_optional_bool(mission_runtime.get("mission_active", mission_runtime.get("active"))),
+                mission_start_in_progress=_optional_bool(mission_runtime.get("mission_start_in_progress")),
+                current_item_index=_optional_int(mission_runtime.get("current_item_index", mission_runtime.get("current_index"))),
+                current_item_type=_optional_str(mission_runtime.get("current_item_type")),
                 vehicle=_mission_runtime_vehicle_snapshot(mission_runtime.get("vehicle")),
-                manual_altitude_active=altitude_offset_active,
-                altitude_offset_m=altitude_offset_m,
-                altitude_offset_active=altitude_offset_active,
-                altitude_offset_rate_m_s=_optional_float(altitude_block.get("offset_rate_m_s")),
-                base_altitude_msl=base_altitude_msl,
-                actual_target_altitude_msl=actual_target_altitude_msl,
-                altitude=altitude_block if altitude_block else None,
+                manual_altitude_active=_optional_bool(mission_runtime.get("manual_altitude_active")),
+                altitude_offset_m=_optional_float(mission_runtime.get("altitude_offset_m")),
                 throttle_input=_optional_float(mission_runtime.get("throttle_input")),
                 climb_rate_command_m_s=_optional_float(mission_runtime.get("climb_rate_command_m_s")),
-                target=_target_snapshot(mission_runtime.get("target", current_target)),
+                target=_target_snapshot(mission_runtime.get("target")),
                 payload_servo=_payload_servo_snapshot(mission_runtime.get("payload_servo")),
-                pause=_pause_snapshot(pause_payload),
-                raw_state=mission_runtime if mission_runtime else None,
+                pause=_pause_snapshot(mission_runtime.get("pause")),
                 last_error=_optional_str(mission_runtime.get("last_error")),
                 last_update_age_s=mission_runtime_age,
             ),
@@ -694,22 +643,11 @@ def _target_snapshot(value: Any) -> TargetSnapshot:
 
 def _mission_runtime_vehicle_snapshot(value: Any) -> MissionRuntimeVehicleSnapshot:
     payload = value if isinstance(value, dict) else {}
-    armed = _optional_bool(payload.get("armed"))
-    arming_state = _optional_int(payload.get("arming_state"))
-    if armed is None and arming_state is not None:
-        armed = arming_state == VehicleStatus.ARMING_STATE_ARMED
     return MissionRuntimeVehicleSnapshot(
         valid=_optional_bool(payload.get("valid")),
-        global_position_valid=_optional_bool(payload.get("global_position_valid")),
-        armed=armed,
+        armed=_optional_bool(payload.get("armed")),
         landed=_optional_bool(payload.get("landed")),
         nav_state=_optional_int(payload.get("nav_state")),
-        arming_state=arming_state,
-        executor_in_charge=_optional_int(payload.get("executor_in_charge")),
-        failsafe=_optional_bool(payload.get("failsafe")),
-        lat=_optional_float(payload.get("lat")),
-        lon=_optional_float(payload.get("lon")),
-        alt_msl=_optional_float(payload.get("alt_msl")),
         x_ned_m=_optional_float(payload.get("x_ned_m")),
         y_ned_m=_optional_float(payload.get("y_ned_m")),
         z_ned_m=_optional_float(payload.get("z_ned_m")),

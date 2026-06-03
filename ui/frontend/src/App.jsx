@@ -13,7 +13,12 @@ const DEFAULT_DEFAULTS = {
 const EMPTY_STATUS = {
   ros_ready: false,
   mission_topic: "/adaptive_mission_mode/mission_json",
-  activate_topic: "/adaptive_mission_mode/activate_json",
+  activate_topic: "/adaptive_mission_mode/activate",
+  pickup_topic: "/adaptive_mission_mode/pickup",
+  pause_rtl_topic: "/adaptive_mission_mode/pause_rtl",
+  continue_mission_topic: "/adaptive_mission_mode/continue_mission",
+  start_topic: "/adaptive_mission_mode/activate",
+  return_home_topic: "/adaptive_mission_mode/activate",
   vehicle: {
     connected: false,
     flight_mode: null,
@@ -27,11 +32,24 @@ const EMPTY_STATUS = {
     battery_percent: null,
     last_status_age_s: null,
     last_position_age_s: null,
+    last_local_position_age_s: null,
     last_battery_age_s: null,
     position: {
       latitude_deg: null,
       longitude_deg: null,
       altitude_amsl_m: null,
+      relative_altitude_m: null,
+      source: null,
+      local_x_ned_m: null,
+      local_y_ned_m: null,
+      local_z_ned_m: null,
+      local_heading_rad: null,
+      local_xy_valid: null,
+      local_z_valid: null,
+      local_reference_valid: null,
+      ref_lat_deg: null,
+      ref_lon_deg: null,
+      ref_alt_msl_m: null,
     },
   },
   mission_cache: {
@@ -39,19 +57,57 @@ const EMPTY_STATUS = {
     mission_name: null,
     item_count: 0,
     last_mission_publish_at: null,
-    last_activate_publish_at: null,
+    last_start_publish_at: null,
+    last_return_home_publish_at: null,
+    last_pause_rtl_publish_at: null,
+    last_continue_publish_at: null,
   },
   mission_runtime: {
     available: false,
     runtime_state: null,
-    active_bt_branch: null,
     mission_ready: null,
     mission_active: null,
     mission_start_in_progress: null,
     current_item_index: null,
+    current_item_type: null,
+    vehicle: {
+      valid: null,
+      armed: null,
+      landed: null,
+      nav_state: null,
+      x_ned_m: null,
+      y_ned_m: null,
+      z_ned_m: null,
+      local_reference_valid: null,
+      ref_lat_deg: null,
+      ref_lon_deg: null,
+      ref_alt_msl_m: null,
+    },
     manual_altitude_active: null,
     altitude_offset_m: null,
     throttle_input: null,
+    climb_rate_command_m_s: null,
+    target: {
+      valid: null,
+      x_ned_m: null,
+      y_ned_m: null,
+      base_z_ned_m: null,
+      effective_z_ned_m: null,
+      altitude_offset_m: null,
+    },
+    payload_servo: {
+      active: null,
+      item_index: null,
+      channel: null,
+      pwm_us: null,
+      pulse_high: null,
+    },
+    pause: {
+      phase: null,
+      paused: null,
+      has_pause_point: null,
+      pause_point: null,
+    },
     last_error: null,
     last_update_age_s: null,
   },
@@ -98,6 +154,17 @@ const MAP_3D_ALTITUDE_SCALE = 1.55;
 const MAP_3D_MAX_VISUAL_ALTITUDE_M = 120;
 const MAX_FLIGHT_TRACK_JUMP_M = 120;
 
+// Chỉnh độ dày đường line mission tại đây.
+// Đơn vị là mét trong scene 3D; tăng số này nếu muốn line to hơn.
+const MISSION_PATH_LINE_THICKNESS_M = 0.34;
+const MISSION_PATH_LINE_OPACITY = 0.94;
+const MISSION_PATH_LINE_COLOR = 0x22d3ee;
+
+// Chỉnh mức sáng/halo của waypoint đang được ROS mode thực hiện.
+const ACTIVE_MISSION_MARKER_EMISSIVE_INTENSITY = 1.15;
+const ACTIVE_MISSION_MARKER_GLOW_OPACITY = 0.26;
+const ACTIVE_MISSION_MARKER_GLOW_RADIUS_EXTRA_M = 1.05;
+
 
 const PX4_MAIN_MODE = {
   1: "MANUAL",
@@ -136,27 +203,40 @@ const MISSION_ICON = {
   takeoff: "rocket_launch",
   waypoint: "add_location_alt",
   hold: "pause_circle",
+  changeSettings: "tune",
   land: "flight_land",
   rtl: "home_pin",
+  pickup: "inventory_2",
+  servoPulse: "settings_input_component",
+  customAction: "extension",
 };
 
 const MISSION_LABEL = {
   takeoff: "TO",
   waypoint: "WP",
   hold: "HOLD",
+  changeSettings: "SET",
   land: "LAND",
   rtl: "RTL",
+  pickup: "PICK",
+  servoPulse: "SERVO",
+  customAction: "ACT",
 };
 
 const MISSION_MARKER_STYLE = {
   takeoff: "border-emerald-100 bg-emerald-400 text-zinc-950 ring-emerald-300/20",
   waypoint: "border-cyan-100 bg-cyan-400 text-zinc-950 ring-cyan-300/20",
   hold: "border-amber-100 bg-amber-300 text-zinc-950 ring-amber-300/20",
+  changeSettings: "border-sky-100 bg-sky-400 text-zinc-950 ring-sky-300/20",
   land: "border-violet-100 bg-violet-400 text-zinc-950 ring-violet-300/20",
   rtl: "border-rose-100 bg-rose-400 text-zinc-950 ring-rose-300/20",
+  pickup: "border-orange-100 bg-orange-300 text-zinc-950 ring-orange-300/20",
+  servoPulse: "border-lime-100 bg-lime-300 text-zinc-950 ring-lime-300/20",
+  customAction: "border-fuchsia-100 bg-fuchsia-400 text-zinc-950 ring-fuchsia-300/20",
 };
 
-const MAP_COORDINATE_ITEM_TYPES = new Set(["waypoint", "hold", "land"]);
+const MAP_COORDINATE_ITEM_TYPES = new Set(["waypoint"]);
+const ALTITUDE_DRAG_ITEM_TYPES = new Set(["takeoff", "waypoint", "hold", "land"]);
 
 function clamp(value, min, max) {
   return Math.min(Math.max(value, min), max);
@@ -168,6 +248,24 @@ function clampLatitude(latitude) {
 
 function hasValidCoordinate(latitude, longitude) {
   return Number.isFinite(Number(latitude)) && Number.isFinite(Number(longitude));
+}
+
+function nedOffsetToLatLon(refLatDeg, refLonDeg, northM, eastM) {
+  const earthRadiusM = 6378137;
+  const refLatRad = Number(refLatDeg) * Math.PI / 180;
+  const latitude = Number(refLatDeg) + (Number(northM) / earthRadiusM) * 180 / Math.PI;
+  const lonScale = Math.max(Math.cos(refLatRad), 1e-7);
+  const longitude = Number(refLonDeg) + (Number(eastM) / (earthRadiusM * lonScale)) * 180 / Math.PI;
+  return { latitude_deg: clampLatitude(latitude), longitude_deg: longitude };
+}
+
+function coordinateFromLocalNed(localX, localY, refLat, refLon) {
+  if (!Number.isFinite(Number(localX)) || !Number.isFinite(Number(localY))) {
+    return null;
+  }
+  const anchorLat = Number.isFinite(Number(refLat)) ? Number(refLat) : DEFAULT_MAP_CENTER.latitude_deg;
+  const anchorLon = Number.isFinite(Number(refLon)) ? Number(refLon) : DEFAULT_MAP_CENTER.longitude_deg;
+  return nedOffsetToLatLon(anchorLat, anchorLon, Number(localX), Number(localY));
 }
 
 function isDroneArmed(status) {
@@ -194,6 +292,14 @@ function itemCanUseMapCoordinate(item) {
   return MAP_COORDINATE_ITEM_TYPES.has(item?.type);
 }
 
+function itemCanDragAltitude(item) {
+  return ALTITUDE_DRAG_ITEM_TYPES.has(item?.type);
+}
+
+function itemCanInteractOnMap(item) {
+  return itemCanUseMapCoordinate(item) || itemCanDragAltitude(item);
+}
+
 function findFirstMissionCoordinate(items, livePosition) {
   const firstItem = items.find((item) => hasValidCoordinate(item.latitude_deg, item.longitude_deg));
   if (firstItem) {
@@ -213,19 +319,137 @@ function findFirstMissionCoordinate(items, livePosition) {
   return null;
 }
 
-function getMissionMarkerCoordinate(item, index, items, livePosition) {
-  if (item.type === "rtl") {
-    if (hasValidCoordinate(livePosition?.latitude_deg, livePosition?.longitude_deg)) {
-      return {
-        latitude_deg: Number(livePosition.latitude_deg),
-        longitude_deg: Number(livePosition.longitude_deg),
-        fromFallback: true,
-        fromDrone: true,
-      };
+function findPreviousWaypointIndex(items, index) {
+  for (let cursor = index - 1; cursor >= 0; cursor -= 1) {
+    if (items[cursor]?.type === "waypoint") {
+      return cursor;
+    }
+  }
+  return null;
+}
+
+function buildWaypointActionSummary(items) {
+  const summaryByWaypointIndex = new Map();
+  const parentByActionIndex = new Map();
+
+  items.forEach((item, index) => {
+    if (item?.type !== "hold" && item?.type !== "land") {
+      return;
     }
 
-    const homeCoordinate = findFirstMissionCoordinate(items, null);
-    return homeCoordinate ? { ...homeCoordinate, fromFallback: true } : null;
+    const parentIndex = findPreviousWaypointIndex(items, index);
+    if (!Number.isInteger(parentIndex)) {
+      return;
+    }
+
+    const summary = summaryByWaypointIndex.get(parentIndex) ?? {
+      holdItems: [],
+      landItems: [],
+      totalHoldTimeS: 0,
+      hasHold: false,
+      hasLand: false,
+    };
+
+    if (item.type === "hold") {
+      const holdTimeS = Number.isFinite(Number(item.hold_time_s)) ? Math.max(0, Number(item.hold_time_s)) : 0;
+      summary.holdItems.push({ index, holdTimeS });
+      summary.totalHoldTimeS += holdTimeS;
+      summary.hasHold = true;
+      parentByActionIndex.set(index, parentIndex);
+    }
+
+    if (item.type === "land") {
+      summary.landItems.push({ index });
+      summary.hasLand = true;
+      parentByActionIndex.set(index, parentIndex);
+    }
+
+    summaryByWaypointIndex.set(parentIndex, summary);
+  });
+
+  return { summaryByWaypointIndex, parentByActionIndex };
+}
+
+function formatHoldTimeLabel(value) {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    return "HOLD";
+  }
+  if (seconds >= 60) {
+    const minutes = Math.floor(seconds / 60);
+    const remainingSeconds = Math.round(seconds % 60);
+    return remainingSeconds > 0 ? `HOLD ${minutes}m${remainingSeconds}s` : `HOLD ${minutes}m`;
+  }
+  return `HOLD ${seconds.toFixed(seconds >= 10 ? 0 : 1)}s`;
+}
+
+function getActionHomeDisplayCoordinate(item, livePosition, homeCoordinate = null) {
+  // Takeoff/RTL là action không có lat/lon trong payload mission, nhưng UI vẫn cần
+  // một điểm hiển thị. Ưu tiên điểm đã chốt lúc tạo item; nếu điểm đó hoặc HOME
+  // bị dính map-origin/local-reference sai quá xa UAV thì dùng live UAV làm fallback.
+  // Như vậy marker không bị nhảy ra tọa độ map, còn độ cao vẫn xử lý riêng ở phần vẽ.
+  const candidates = [
+    {
+      latitude_deg: item.display_latitude_deg,
+      longitude_deg: item.display_longitude_deg,
+      fromFallback: false,
+      fromHome: true,
+      source: "item display home",
+    },
+    {
+      latitude_deg: homeCoordinate?.latitude_deg,
+      longitude_deg: homeCoordinate?.longitude_deg,
+      fromFallback: false,
+      fromHome: true,
+      source: homeCoordinate?.source ?? "home",
+    },
+  ];
+
+  const liveValid = hasValidCoordinate(livePosition?.latitude_deg, livePosition?.longitude_deg);
+  const maxTrustedHomeDistanceM = 500;
+
+  for (const candidate of candidates) {
+    if (!hasValidCoordinate(candidate.latitude_deg, candidate.longitude_deg)) {
+      continue;
+    }
+
+    const normalized = {
+      latitude_deg: Number(candidate.latitude_deg),
+      longitude_deg: Number(candidate.longitude_deg),
+      fromFallback: candidate.fromFallback,
+      fromHome: candidate.fromHome,
+      source: candidate.source,
+    };
+
+    if (!liveValid) {
+      return normalized;
+    }
+
+    const distanceToUavM = haversineDistanceMeters(normalized, livePosition);
+    if (distanceToUavM <= maxTrustedHomeDistanceM) {
+      return normalized;
+    }
+  }
+
+  if (liveValid) {
+    return {
+      latitude_deg: Number(livePosition.latitude_deg),
+      longitude_deg: Number(livePosition.longitude_deg),
+      fromFallback: true,
+      fromHome: true,
+      source: "live UAV fallback",
+    };
+  }
+
+  const fallbackHomeCoordinate = findFirstMissionCoordinate([], livePosition);
+  return fallbackHomeCoordinate ? { ...fallbackHomeCoordinate, fromFallback: true, fromHome: true } : null;
+}
+
+function getMissionMarkerCoordinate(item, index, items, livePosition, homeCoordinate = null) {
+  // Takeoff và RTL chỉ là action marker của UI: XY neo tại home/drone display,
+  // còn altitude không lấy từ UAV live mà xử lý riêng ở getVisualAltitudeM.
+  if (item.type === "takeoff" || item.type === "rtl") {
+    return getActionHomeDisplayCoordinate(item, livePosition, homeCoordinate);
   }
 
   if (hasValidCoordinate(item.latitude_deg, item.longitude_deg)) {
@@ -273,19 +497,58 @@ function decodePx4Mode(customMode) {
 
 function getLivePosition(status) {
   const mavlink = status?.mavlink ?? {};
+  const rosPosition = status?.vehicle?.position ?? {};
+
+  const mavLocalX = mavlink.local_x_ned_m ?? rosPosition.local_x_ned_m ?? null;
+  const mavLocalY = mavlink.local_y_ned_m ?? rosPosition.local_y_ned_m ?? null;
+  const mavLocalZ = mavlink.local_z_ned_m ?? rosPosition.local_z_ned_m ?? null;
+
+  if (hasValidCoordinate(rosPosition.latitude_deg, rosPosition.longitude_deg)) {
+    return {
+      ...rosPosition,
+      relative_altitude_m: rosPosition.relative_altitude_m ?? mavlink.relative_altitude_m ?? null,
+      altitude_amsl_m: rosPosition.altitude_amsl_m ?? mavlink.altitude_amsl_m ?? null,
+      local_x_ned_m: rosPosition.local_x_ned_m ?? mavlink.local_x_ned_m ?? null,
+      local_y_ned_m: rosPosition.local_y_ned_m ?? mavlink.local_y_ned_m ?? null,
+      local_z_ned_m: rosPosition.local_z_ned_m ?? mavlink.local_z_ned_m ?? null,
+      source: rosPosition.source ?? "ROS 2",
+    };
+  }
+
   if (mavlink.connected && hasValidCoordinate(mavlink.latitude_deg, mavlink.longitude_deg)) {
     return {
       latitude_deg: mavlink.latitude_deg,
       longitude_deg: mavlink.longitude_deg,
       altitude_amsl_m: mavlink.altitude_amsl_m,
       relative_altitude_m: mavlink.relative_altitude_m,
+      local_x_ned_m: mavLocalX,
+      local_y_ned_m: mavLocalY,
+      local_z_ned_m: mavLocalZ,
+      ref_lat_deg: rosPosition.ref_lat_deg ?? null,
+      ref_lon_deg: rosPosition.ref_lon_deg ?? null,
       source: "MAVLink",
     };
   }
 
-  const rosPosition = status?.vehicle?.position ?? {};
-  if (hasValidCoordinate(rosPosition.latitude_deg, rosPosition.longitude_deg)) {
-    return { ...rosPosition, relative_altitude_m: null, source: "ROS 2" };
+  const localCoordinate = coordinateFromLocalNed(
+    rosPosition.local_x_ned_m ?? mavlink.local_x_ned_m,
+    rosPosition.local_y_ned_m ?? mavlink.local_y_ned_m,
+    rosPosition.ref_lat_deg,
+    rosPosition.ref_lon_deg,
+  );
+  if (localCoordinate) {
+    const localZ = rosPosition.local_z_ned_m ?? mavlink.local_z_ned_m ?? null;
+    return {
+      ...localCoordinate,
+      altitude_amsl_m: null,
+      relative_altitude_m: Number.isFinite(Number(localZ)) ? -Number(localZ) : null,
+      local_x_ned_m: rosPosition.local_x_ned_m ?? mavlink.local_x_ned_m ?? null,
+      local_y_ned_m: rosPosition.local_y_ned_m ?? mavlink.local_y_ned_m ?? null,
+      local_z_ned_m: localZ,
+      ref_lat_deg: rosPosition.ref_lat_deg ?? DEFAULT_MAP_CENTER.latitude_deg,
+      ref_lon_deg: rosPosition.ref_lon_deg ?? DEFAULT_MAP_CENTER.longitude_deg,
+      source: rosPosition.ref_lat_deg && rosPosition.ref_lon_deg ? "ROS 2 local NED" : "Local NED map-origin fallback",
+    };
   }
 
   return {
@@ -293,30 +556,95 @@ function getLivePosition(status) {
     longitude_deg: null,
     altitude_amsl_m: null,
     relative_altitude_m: null,
+    local_x_ned_m: rosPosition.local_x_ned_m ?? mavlink.local_x_ned_m ?? null,
+    local_y_ned_m: rosPosition.local_y_ned_m ?? mavlink.local_y_ned_m ?? null,
+    local_z_ned_m: rosPosition.local_z_ned_m ?? mavlink.local_z_ned_m ?? null,
     source: "none",
   };
 }
 
+
+function getHomeCoordinate(status, fallbackPosition = null) {
+  const rosPosition = status?.vehicle?.position ?? {};
+  const runtimeVehicle = status?.mission_runtime?.vehicle ?? status?.vehicle?.runtime_vehicle ?? {};
+  const mavlink = status?.mavlink ?? {};
+
+  const candidates = [
+    {
+      latitude_deg: runtimeVehicle.ref_lat_deg,
+      longitude_deg: runtimeVehicle.ref_lon_deg,
+      altitude_amsl_m: runtimeVehicle.ref_alt_msl_m,
+      source: "PX4 mission local reference",
+    },
+    {
+      latitude_deg: rosPosition.ref_lat_deg,
+      longitude_deg: rosPosition.ref_lon_deg,
+      altitude_amsl_m: rosPosition.ref_alt_msl_m,
+      source: "PX4 local reference",
+    },
+    {
+      latitude_deg: mavlink.global_origin_lat_deg,
+      longitude_deg: mavlink.global_origin_lon_deg,
+      altitude_amsl_m: mavlink.global_origin_alt_msl_m,
+      source: "MAVLink global origin",
+    },
+    {
+      latitude_deg: fallbackPosition?.ref_lat_deg,
+      longitude_deg: fallbackPosition?.ref_lon_deg,
+      altitude_amsl_m: fallbackPosition?.ref_alt_msl_m,
+      source: "live local reference",
+    },
+  ];
+
+  const coordinate = candidates.find((candidate) => hasValidCoordinate(candidate.latitude_deg, candidate.longitude_deg));
+  if (coordinate) {
+    return {
+      latitude_deg: Number(coordinate.latitude_deg),
+      longitude_deg: Number(coordinate.longitude_deg),
+      altitude_amsl_m: normalizeNumber(coordinate.altitude_amsl_m),
+      relative_altitude_m: 0,
+      source: coordinate.source,
+    };
+  }
+
+  if (hasValidCoordinate(fallbackPosition?.latitude_deg, fallbackPosition?.longitude_deg)) {
+    return {
+      latitude_deg: Number(fallbackPosition.latitude_deg),
+      longitude_deg: Number(fallbackPosition.longitude_deg),
+      altitude_amsl_m: normalizeNumber(fallbackPosition.altitude_amsl_m),
+      relative_altitude_m: 0,
+      source: "first live position fallback",
+    };
+  }
+
+  return null;
+}
+
+
 function getDroneTelemetry(status) {
   const mavlink = status?.mavlink ?? {};
   const vehicle = status?.vehicle ?? {};
-  const hasMavlink = mavlink.enabled || mavlink.connected || mavlink.last_message_age_s != null;
+  const position = vehicle.position ?? {};
+  const useMavlink = Boolean(mavlink.connected);
+  const headingFromLocal = Number.isFinite(Number(position.local_heading_rad))
+    ? Number(position.local_heading_rad) * 180 / Math.PI
+    : null;
 
   return {
     id: `${mavlink.target_system ?? vehicle.system_id ?? 1}:${mavlink.target_component ?? vehicle.component_id ?? 1}`,
     name: `Drone ${mavlink.target_system ?? vehicle.system_id ?? 1}`,
-    source: hasMavlink ? "MAVLink" : "ROS 2",
-    connected: hasMavlink ? Boolean(mavlink.connected) : Boolean(vehicle.connected),
-    armed: hasMavlink ? Boolean(mavlink.armed) : Boolean(vehicle.armed),
-    mode: hasMavlink ? decodePx4Mode(mavlink.custom_mode) : vehicle.flight_mode ?? "--",
+    source: useMavlink ? "MAVLink" : "ROS 2",
+    connected: useMavlink ? true : Boolean(vehicle.connected),
+    armed: useMavlink ? Boolean(mavlink.armed) : Boolean(vehicle.armed),
+    mode: useMavlink ? decodePx4Mode(mavlink.custom_mode) : vehicle.flight_mode ?? "--",
     navState: vehicle.nav_state ?? "--",
     preflight: vehicle.preflight_checks_pass,
     failsafe: vehicle.failsafe,
     batteryPercent: mavlink.battery_percent ?? vehicle.battery_percent,
     voltage: mavlink.voltage_battery_v,
     current: mavlink.current_battery_a,
-    headingDeg: mavlink.heading_deg ?? mavlink.yaw_deg ?? null,
-    yawDeg: mavlink.yaw_deg ?? null,
+    headingDeg: mavlink.heading_deg ?? mavlink.yaw_deg ?? headingFromLocal,
+    yawDeg: mavlink.yaw_deg ?? headingFromLocal,
     rollDeg: mavlink.roll_deg ?? null,
     pitchDeg: mavlink.pitch_deg ?? null,
     baseMode: mavlink.base_mode,
@@ -327,14 +655,16 @@ function getDroneTelemetry(status) {
     targetSystem: mavlink.target_system ?? vehicle.system_id,
     targetComponent: mavlink.target_component ?? vehicle.component_id,
     heartbeatAge: mavlink.last_heartbeat_age_s,
-    messageAge: mavlink.last_message_age_s ?? vehicle.last_status_age_s,
-    positionAge: vehicle.last_position_age_s,
+    messageAge: useMavlink ? mavlink.last_message_age_s : vehicle.last_status_age_s,
+    positionAge: vehicle.last_position_age_s ?? vehicle.last_local_position_age_s,
+    localPositionAge: vehicle.last_local_position_age_s,
     connectionUrl: mavlink.connection_url,
     lastError: mavlink.last_error,
     lastStatustext: mavlink.last_statustext,
     messageCounts: mavlink.message_counts ?? {},
   };
 }
+
 
 function getDroneOptions(status) {
   if (Array.isArray(status?.drones) && status.drones.length > 0) {
@@ -486,6 +816,39 @@ function createTextSprite(THREERef, text, options = {}) {
   return sprite;
 }
 
+function createCircleActionSprite(THREERef, text, options = {}) {
+  const canvas = document.createElement("canvas");
+  const context = canvas.getContext("2d");
+  const size = options.size ?? 128;
+  canvas.width = size;
+  canvas.height = size;
+
+  const center = size / 2;
+  const radius = size * 0.43;
+  context.clearRect(0, 0, size, size);
+  context.beginPath();
+  context.arc(center, center, radius, 0, Math.PI * 2);
+  context.fillStyle = options.background ?? "rgba(2, 6, 23, 0.92)";
+  context.fill();
+  context.lineWidth = size * 0.055;
+  context.strokeStyle = options.border ?? "rgba(255,255,255,0.70)";
+  context.stroke();
+
+  context.font = `900 ${options.fontSize ?? 62}px Inter, system-ui, sans-serif`;
+  context.textAlign = "center";
+  context.textBaseline = "middle";
+  context.fillStyle = options.color ?? "#f8fafc";
+  context.fillText(String(text), center, center + size * 0.015);
+
+  const texture = new THREERef.CanvasTexture(canvas);
+  texture.colorSpace = THREERef.SRGBColorSpace;
+  const material = new THREERef.SpriteMaterial({ map: texture, transparent: true, depthTest: false, depthWrite: false });
+  const sprite = new THREERef.Sprite(material);
+  const scale = options.scale ?? 0.040;
+  sprite.scale.set(size * scale, size * scale, 1);
+  return sprite;
+}
+
 function formatAge(value) {
   if (value == null || !Number.isFinite(Number(value))) {
     return "--";
@@ -520,7 +883,106 @@ function formatLinkSummary(value) {
   return text;
 }
 
-function getVisualAltitudeM(item, livePosition) {
+function getMissionRuntimeState(status) {
+  return String(status?.mission_runtime?.runtime_state ?? status?.state ?? "").trim().toLowerCase();
+}
+
+function getRawMissionAltitudeOffsetM(status) {
+  const candidates = [
+    status?.mission_runtime?.altitude_offset_m,
+    status?.mission_runtime?.target?.altitude_offset_m,
+    status?.altitude?.offset_m,
+  ];
+
+  const value = candidates.find((candidate) => Number.isFinite(Number(candidate)));
+  return Number.isFinite(Number(value)) ? Number(value) : 0;
+}
+
+function isMissionAltitudeOffsetVisible(status) {
+  const runtimeState = getMissionRuntimeState(status);
+  const terminalStates = new Set([
+    "",
+    "idle",
+    "completed",
+    "complete",
+    "finished",
+    "done",
+    "cancel",
+    "cancelled",
+    "canceled",
+    "aborted",
+    "error",
+  ]);
+
+  if (terminalStates.has(runtimeState)) {
+    return false;
+  }
+
+  const active = Boolean(
+    status?.mission_runtime?.mission_active ||
+    status?.mission_runtime?.active ||
+    status?.active ||
+    ["starting", "mission", "pause_rtl", "rtl_landing", "resume_arm", "return_pause_point"].includes(runtimeState),
+  );
+
+  return active;
+}
+
+function getMissionVisualAltitudeOffsetM(status) {
+  const offsetM = getRawMissionAltitudeOffsetM(status);
+  if (!Number.isFinite(offsetM) || Math.abs(offsetM) < 0.005) {
+    return 0;
+  }
+  return isMissionAltitudeOffsetVisible(status) ? offsetM : 0;
+}
+
+function getCurrentMissionItemIndex(status) {
+  const candidates = [
+    status?.mission_runtime?.current_item_index,
+    status?.mission_runtime?.current_item?.index,
+    status?.mission_runtime?.mission?.current_index,
+    status?.mission?.current_index,
+  ];
+
+  const value = candidates.find((candidate) => Number.isInteger(Number(candidate)));
+  if (value == null) {
+    return null;
+  }
+
+  const index = Number(value);
+  return index >= 0 ? index : null;
+}
+
+function getActiveMissionDisplayIndex(items, currentIndex) {
+  if (!Array.isArray(items) || !Number.isInteger(currentIndex) || currentIndex < 0 || currentIndex >= items.length) {
+    return null;
+  }
+
+  const currentItem = items[currentIndex];
+  if (currentItem?.type === "hold" || currentItem?.type === "land") {
+    return findPreviousWaypointIndex(items, currentIndex);
+  }
+
+  return currentIndex;
+}
+
+function getCurrentMissionActionLabel(status, items, currentIndex) {
+  const runtimeItem = status?.mission_runtime?.current_item;
+  const runtimeType = status?.mission_runtime?.current_item_type ?? runtimeItem?.type;
+  const localItem = Number.isInteger(currentIndex) ? items?.[currentIndex] : null;
+  const actionType = runtimeType ?? localItem?.type;
+  const actionId = runtimeItem?.id ?? localItem?.id ?? localItem?.name;
+
+  if (!actionType) {
+    return null;
+  }
+
+  const normalizedType = String(actionType).toLowerCase();
+  const displayType = normalizedType === "navigation" ? "WAYPOINT" : String(actionType).toUpperCase();
+  return actionId ? `▶ ${displayType} · ${actionId}` : `▶ ${displayType}`;
+}
+
+function getBaseVisualAltitudeM(item, livePosition) {
   if (Number.isFinite(Number(item?.altitude_m))) {
     return Math.max(0, Number(item.altitude_m));
   }
@@ -528,6 +990,14 @@ function getVisualAltitudeM(item, livePosition) {
     return Math.max(0, Number(livePosition.relative_altitude_m));
   }
   return 0;
+}
+
+function getVisualAltitudeM(item, livePosition, missionAltitudeOffsetM = 0) {
+  const baseAltitudeM = getBaseVisualAltitudeM(item, livePosition);
+  if (item?.type === "waypoint" && Number.isFinite(Number(missionAltitudeOffsetM))) {
+    return Math.max(0, baseAltitudeM + Number(missionAltitudeOffsetM));
+  }
+  return baseAltitudeM;
 }
 
 function formatAltitudeLabel(value) {
@@ -566,9 +1036,12 @@ function getTakeoffAltitude(missionItems, status) {
 
 function createMissionItem(type, status, missionItems = []) {
   const position = getLivePosition(status ?? EMPTY_STATUS);
+  const homeCoordinate = getHomeCoordinate(status ?? EMPTY_STATUS, position) ?? position;
+  const actionHomeCoordinate = getActionHomeDisplayCoordinate({}, position, homeCoordinate) ?? position;
   const latitude = position.latitude_deg ?? "";
   const longitude = position.longitude_deg ?? "";
-  const altitude = position.altitude_amsl_m ?? "";
+  const actionLatitude = actionHomeCoordinate?.latitude_deg ?? latitude;
+  const actionLongitude = actionHomeCoordinate?.longitude_deg ?? longitude;
   const takeoffAltitude = getTakeoffAltitude(missionItems, status ?? EMPTY_STATUS);
   const mapAltitude = Number.isFinite(Number(takeoffAltitude)) ? Number(takeoffAltitude) : 20;
 
@@ -587,9 +1060,9 @@ function createMissionItem(type, status, missionItems = []) {
     return {
       type,
       name: "Hold",
-      latitude_deg: latitude,
-      longitude_deg: longitude,
-      altitude_m: mapAltitude,
+      latitude_deg: "",
+      longitude_deg: "",
+      altitude_m: "",
       hold_time_s: 5,
     };
   }
@@ -600,6 +1073,8 @@ function createMissionItem(type, status, missionItems = []) {
       name: "Takeoff",
       latitude_deg: "",
       longitude_deg: "",
+      display_latitude_deg: actionLatitude,
+      display_longitude_deg: actionLongitude,
       altitude_m: mapAltitude,
       hold_time_s: 0,
     };
@@ -609,9 +1084,78 @@ function createMissionItem(type, status, missionItems = []) {
     return {
       type,
       name: "Land",
-      latitude_deg: latitude,
-      longitude_deg: longitude,
-      altitude_m: altitude !== "" && altitude != null ? Number(altitude) : "",
+      latitude_deg: "",
+      longitude_deg: "",
+      altitude_m: "",
+      hold_time_s: 0,
+    };
+  }
+
+  if (type === "changeSettings") {
+    return {
+      type,
+      name: "Change Settings",
+      latitude_deg: "",
+      longitude_deg: "",
+      altitude_m: "",
+      hold_time_s: 0,
+      reset_all: false,
+      horizontal_velocity_m_s: "",
+      vertical_velocity_m_s: "",
+      max_heading_rate_deg_s: "",
+    };
+  }
+
+  if (type === "pickup") {
+    return {
+      type,
+      name: "Pickup",
+      latitude_deg: "",
+      longitude_deg: "",
+      altitude_m: "",
+      hold_time_s: 0,
+      custom_json: "{}",
+    };
+  }
+
+  if (type === "servoPulse") {
+    return {
+      type,
+      name: "Servo Pulse",
+      latitude_deg: "",
+      longitude_deg: "",
+      altitude_m: "",
+      hold_time_s: 0,
+      servo_channel: 1,
+      servo_pwm_on_us: 1900,
+      servo_pwm_off_us: 1500,
+      servo_period_s: 0.5,
+      servo_on_duration_s: 0.2,
+    };
+  }
+
+  if (type === "customAction") {
+    return {
+      type,
+      name: "Custom Action",
+      latitude_deg: "",
+      longitude_deg: "",
+      altitude_m: "",
+      hold_time_s: 0,
+      custom_type: "customAction",
+      custom_json: "{}",
+    };
+  }
+
+  if (type === "rtl") {
+    return {
+      type,
+      name: "RTL",
+      latitude_deg: "",
+      longitude_deg: "",
+      display_latitude_deg: actionLatitude,
+      display_longitude_deg: actionLongitude,
+      altitude_m: "",
       hold_time_s: 0,
     };
   }
@@ -642,6 +1186,17 @@ function missionPayload(name, defaults, items) {
         longitude_deg: normalizeNumber(item.longitude_deg),
         altitude_m: normalizeNumber(item.altitude_m),
         hold_time_s: Number(item.hold_time_s || 0),
+        reset_all: Boolean(item.reset_all),
+        horizontal_velocity_m_s: normalizeNumber(item.horizontal_velocity_m_s),
+        vertical_velocity_m_s: normalizeNumber(item.vertical_velocity_m_s),
+        max_heading_rate_deg_s: normalizeNumber(item.max_heading_rate_deg_s),
+        servo_channel: Number(item.servo_channel || 1),
+        servo_pwm_on_us: Number(item.servo_pwm_on_us || 1900),
+        servo_pwm_off_us: Number(item.servo_pwm_off_us || 1500),
+        servo_period_s: Number(item.servo_period_s || 0.5),
+        servo_on_duration_s: Number(item.servo_on_duration_s || 0.2),
+        custom_type: item.custom_type || "customAction",
+        custom_json: item.custom_json || "{}",
       })),
     },
   };
@@ -667,7 +1222,7 @@ function Icon({ name, className = "", ...props }) {
   return <span className={`material-symbols-rounded select-none ${className}`} {...props}>{name}</span>;
 }
 
-function GlassButton({ icon, label, tone = "zinc", disabled = false, onClick }) {
+function GlassButton({ icon, label, tone = "zinc", disabled = false, onClick, className = "" }) {
   const toneMap = {
     zinc: "border-white/10 bg-white/10 text-zinc-100 hover:bg-white/20",
     cyan: "border-cyan-300/30 bg-cyan-400/15 text-cyan-50 hover:bg-cyan-400/25",
@@ -685,10 +1240,10 @@ function GlassButton({ icon, label, tone = "zinc", disabled = false, onClick }) 
         event.stopPropagation();
         onClick?.(event);
       }}
-      className={`inline-flex items-center justify-center gap-2 rounded-2xl border px-3 py-2 text-sm font-bold transition disabled:cursor-not-allowed disabled:opacity-40 ${toneMap[tone]}`}
+      className={`inline-flex min-w-0 items-center justify-center gap-2 rounded-2xl border px-3 py-2 text-sm font-bold leading-tight text-center transition disabled:cursor-not-allowed disabled:opacity-40 ${toneMap[tone]} ${className}`}
     >
-      {icon ? <Icon name={icon} className="text-[20px]" /> : null}
-      {label ? <span>{label}</span> : null}
+      {icon ? <Icon name={icon} className="shrink-0 text-[20px]" /> : null}
+      {label ? <span className="min-w-0 whitespace-normal break-words">{label}</span> : null}
     </button>
   );
 }
@@ -740,6 +1295,24 @@ const MissionMap = memo(function MissionMap({
   const objectGroupRef = useRef(null);
   const helperGroupRef = useRef(null);
   const droneGroupRef = useRef(null);
+  const droneVisualRef = useRef({
+    group: null,
+    disk: null,
+    ring: null,
+    tower: null,
+    arrow: null,
+    label: null,
+    labelKey: "",
+    towerHeightM: null,
+    targetPosition: new THREE.Vector3(),
+    currentPosition: new THREE.Vector3(),
+    targetHeadingRad: 0,
+    currentHeadingRad: 0,
+    visible: false,
+    initialized: false,
+    lastTimestampMs: null,
+    forceSnap: false,
+  });
   const trackGroupRef = useRef(null);
   const animationFrameRef = useRef(null);
   const resizeObserverRef = useRef(null);
@@ -763,6 +1336,7 @@ const MissionMap = memo(function MissionMap({
   const cameraControlRef = useRef({ azimuth: -2.35, elevation: 0.82, distance: 210, target: new THREE.Vector3(0, 0, 0) });
   const currentBaseCoordinateRef = useRef(DEFAULT_MAP_CENTER);
   const baseInitializedRef = useRef(false);
+  const homeCoordinateRef = useRef(null);
   const missionObjectByIndexRef = useRef(new Map());
   const missionLineRef = useRef(null);
   const tileBuildKeyRef = useRef("");
@@ -771,13 +1345,26 @@ const MissionMap = memo(function MissionMap({
   const activeInfoSpriteIndexRef = useRef(null);
   const activeInfoSpriteSignatureRef = useRef("");
   const [sceneBaseCoordinate, setSceneBaseCoordinate] = useState(DEFAULT_MAP_CENTER);
+  const [sceneReadyVersion, setSceneReadyVersion] = useState(0);
   const [overlayAnchor, setOverlayAnchor] = useState({ left: 24, top: 24, visible: false, source: "none" });
   const livePosition = getLivePosition(status);
   const droneTelemetry = getDroneTelemetry(status);
   const hasLivePosition = hasValidCoordinate(livePosition.latitude_deg, livePosition.longitude_deg);
+  const detectedHomeCoordinate = getHomeCoordinate(status, null);
+  if (detectedHomeCoordinate) {
+    homeCoordinateRef.current = detectedHomeCoordinate;
+  } else if (!homeCoordinateRef.current && hasLivePosition) {
+    homeCoordinateRef.current = getHomeCoordinate(status, livePosition);
+  }
+  const homeCoordinate = homeCoordinateRef.current ?? detectedHomeCoordinate;
   const activeMapPickItem = Number.isInteger(activeMapPickIndex) ? missionItems[activeMapPickIndex] : null;
   const hasActiveMapPick = itemCanUseMapCoordinate(activeMapPickItem);
   const tileZoom = 18;
+  const missionAltitudeOffsetM = getMissionVisualAltitudeOffsetM(status);
+  const missionAltitudeOffsetActive = Math.abs(missionAltitudeOffsetM) >= 0.005;
+  const currentMissionItemIndex = getCurrentMissionItemIndex(status);
+  const activeMissionDisplayIndex = getActiveMissionDisplayIndex(missionItems, currentMissionItemIndex);
+  const currentMissionActionLabel = getCurrentMissionActionLabel(status, missionItems, currentMissionItemIndex);
 
   useEffect(() => {
     if (baseInitializedRef.current) {
@@ -785,9 +1372,9 @@ const MissionMap = memo(function MissionMap({
     }
 
     const firstMissionCoordinate = missionItems.find((item) => hasValidCoordinate(item.latitude_deg, item.longitude_deg));
-    const anchor = firstMissionCoordinate
-      ? { latitude_deg: Number(firstMissionCoordinate.latitude_deg), longitude_deg: Number(firstMissionCoordinate.longitude_deg) }
-      : (hasLivePosition ? { latitude_deg: Number(livePosition.latitude_deg), longitude_deg: Number(livePosition.longitude_deg) } : null);
+    const anchor = hasLivePosition
+      ? { latitude_deg: Number(livePosition.latitude_deg), longitude_deg: Number(livePosition.longitude_deg) }
+      : (firstMissionCoordinate ? { latitude_deg: Number(firstMissionCoordinate.latitude_deg), longitude_deg: Number(firstMissionCoordinate.longitude_deg) } : null);
 
     if (!anchor) {
       return;
@@ -896,6 +1483,182 @@ const MissionMap = memo(function MissionMap({
     updateCameraView();
   }
 
+  function clearDroneVisual() {
+    const droneGroup = droneGroupRef.current;
+    const droneVisual = droneVisualRef.current;
+    if (droneGroup) {
+      droneGroup.children.forEach((child) => disposeThreeObject(child));
+      droneGroup.clear();
+    }
+    droneVisual.group = null;
+    droneVisual.disk = null;
+    droneVisual.ring = null;
+    droneVisual.tower = null;
+    droneVisual.arrow = null;
+    droneVisual.label = null;
+    droneVisual.labelKey = "";
+    droneVisual.towerHeightM = null;
+    droneVisual.visible = false;
+    droneVisual.initialized = false;
+    droneVisual.lastTimestampMs = null;
+  }
+
+  function ensureDroneVisual() {
+    const droneGroup = droneGroupRef.current;
+    const droneVisual = droneVisualRef.current;
+    if (!droneGroup) {
+      return null;
+    }
+    if (droneVisual.group && droneGroup.children.includes(droneVisual.group)) {
+      return droneVisual.group;
+    }
+
+    droneGroup.children.forEach((child) => disposeThreeObject(child));
+    droneGroup.clear();
+
+    const visualGroup = new THREE.Group();
+    visualGroup.visible = false;
+    droneGroup.add(visualGroup);
+
+    const droneMaterial = new THREE.MeshStandardMaterial({ color: 0x10b981, roughness: 0.2, metalness: 0.22, emissive: 0x10b981, emissiveIntensity: 0.68 });
+    const droneDisk = new THREE.Mesh(new THREE.CylinderGeometry(1.42, 1.42, 0.54, 42), droneMaterial);
+    visualGroup.add(droneDisk);
+
+    const droneRing = new THREE.Mesh(
+      new THREE.TorusGeometry(2.05, 0.075, 8, 48),
+      new THREE.MeshBasicMaterial({ color: 0x86efac, transparent: true, opacity: 0.82 }),
+    );
+    droneRing.rotation.x = Math.PI / 2;
+    visualGroup.add(droneRing);
+
+    const headingVector = new THREE.Vector3(0, 0, -1);
+    const arrow = new THREE.ArrowHelper(headingVector, new THREE.Vector3(0, 0.76, 0), 4.5, 0xf0fdf4, 1.25, 0.72);
+    visualGroup.add(arrow);
+
+    droneVisual.group = visualGroup;
+    droneVisual.disk = droneDisk;
+    droneVisual.ring = droneRing;
+    droneVisual.arrow = arrow;
+    droneVisual.tower = null;
+    droneVisual.label = null;
+    droneVisual.labelKey = "";
+    droneVisual.towerHeightM = null;
+    return visualGroup;
+  }
+
+  function updateDroneTower(altitudeM) {
+    const droneVisual = droneVisualRef.current;
+    const visualGroup = droneVisual.group;
+    if (!visualGroup) {
+      return;
+    }
+
+    const heightM = Math.max(0, Number(altitudeM) || 0);
+    if (heightM <= 1.2) {
+      if (droneVisual.tower) {
+        droneVisual.tower.visible = false;
+      }
+      droneVisual.towerHeightM = heightM;
+      return;
+    }
+
+    if (!droneVisual.tower) {
+      const tower = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.095, 0.095, 1, 8),
+        new THREE.MeshBasicMaterial({ color: 0x86efac, transparent: true, opacity: 0.30 }),
+      );
+      visualGroup.add(tower);
+      droneVisual.tower = tower;
+    }
+
+    droneVisual.tower.visible = true;
+    droneVisual.tower.scale.set(1, heightM, 1);
+    droneVisual.tower.position.set(0, -heightM / 2, 0);
+    droneVisual.towerHeightM = heightM;
+  }
+
+
+  function updateDroneLabel(altitudeM) {
+    const droneVisual = droneVisualRef.current;
+    const visualGroup = droneVisual.group;
+    if (!visualGroup) {
+      return;
+    }
+
+    const labelKey = formatAltitudeLabel(altitudeM);
+    if (droneVisual.label && droneVisual.labelKey === labelKey) {
+      droneVisual.label.position.set(0, 3.8, 0);
+      return;
+    }
+
+    if (droneVisual.label) {
+      visualGroup.remove(droneVisual.label);
+      disposeThreeObject(droneVisual.label);
+      droneVisual.label = null;
+    }
+
+    const droneLabel = createTextSprite(THREE, `UAV\n${labelKey}`, {
+      color: "#ecfdf5",
+      subColor: "#bbf7d0",
+      background: "rgba(2, 6, 23, 0.92)",
+      border: "rgba(134,239,172,0.82)",
+      scale: 0.056,
+      fontSize: 32,
+    });
+    droneLabel.position.set(0, 3.8, 0);
+    visualGroup.add(droneLabel);
+    droneVisual.label = droneLabel;
+    droneVisual.labelKey = labelKey;
+  }
+
+  function updateDroneAnimatedFrame(timestampMs) {
+    const droneVisual = droneVisualRef.current;
+    const visualGroup = droneVisual.group;
+    if (!visualGroup) {
+      return;
+    }
+
+    if (!droneVisual.visible) {
+      visualGroup.visible = false;
+      droneVisual.lastTimestampMs = timestampMs;
+      return;
+    }
+
+    visualGroup.visible = true;
+    const previousTimestampMs = Number.isFinite(droneVisual.lastTimestampMs) ? droneVisual.lastTimestampMs : timestampMs;
+    const dtSec = clamp((timestampMs - previousTimestampMs) / 1000, 0.001, 0.12);
+    droneVisual.lastTimestampMs = timestampMs;
+
+    const distanceToTarget = droneVisual.currentPosition.distanceTo(droneVisual.targetPosition);
+    if (!droneVisual.initialized || droneVisual.forceSnap || distanceToTarget > 160) {
+      droneVisual.currentPosition.copy(droneVisual.targetPosition);
+      droneVisual.currentHeadingRad = droneVisual.targetHeadingRad;
+      droneVisual.initialized = true;
+      droneVisual.forceSnap = false;
+    } else {
+      const positionAlpha = 1 - Math.exp(-7.5 * dtSec);
+      const headingAlpha = 1 - Math.exp(-10.0 * dtSec);
+      droneVisual.currentPosition.lerp(droneVisual.targetPosition, positionAlpha);
+      if (distanceToTarget < 0.012) {
+        droneVisual.currentPosition.copy(droneVisual.targetPosition);
+      }
+      const headingError = Math.atan2(
+        Math.sin(droneVisual.targetHeadingRad - droneVisual.currentHeadingRad),
+        Math.cos(droneVisual.targetHeadingRad - droneVisual.currentHeadingRad),
+      );
+      droneVisual.currentHeadingRad += headingError * headingAlpha;
+    }
+
+    visualGroup.position.copy(droneVisual.currentPosition);
+    const headingVector = new THREE.Vector3(Math.sin(droneVisual.currentHeadingRad), 0, -Math.cos(droneVisual.currentHeadingRad)).normalize();
+    if (droneVisual.arrow?.setDirection) {
+      droneVisual.arrow.setDirection(headingVector);
+    }
+
+    const smoothAltitudeM = Math.max(0.65, droneVisual.currentPosition.y);
+    updateDroneTower(smoothAltitudeM);
+  }
+
   function resizeThreeRenderer() {
     if (!mountRef.current || !rendererRef.current || !cameraRef.current) {
       return;
@@ -973,8 +1736,15 @@ const MissionMap = memo(function MissionMap({
       return;
     }
 
+    const curve = new THREE.CatmullRomCurve3(points, false, "catmullrom", 0.05);
     line.geometry.dispose();
-    line.geometry = new THREE.BufferGeometry().setFromPoints(points);
+    line.geometry = new THREE.TubeGeometry(
+      curve,
+      Math.max(2, points.length * 12),
+      MISSION_PATH_LINE_THICKNESS_M,
+      8,
+      false,
+    );
   }
 
   function buildMissionInfoData(index, override = {}) {
@@ -984,7 +1754,7 @@ const MissionMap = memo(function MissionMap({
 
     const entry = missionObjectByIndexRef.current.get(index);
     const item = missionItems[index];
-    if (!entry || !item || !itemCanUseMapCoordinate(item)) {
+    if (!entry || !item || !itemCanInteractOnMap(item)) {
       return null;
     }
 
@@ -1076,7 +1846,7 @@ const MissionMap = memo(function MissionMap({
     const nextIndex = Number.isInteger(markerHit?.userData?.index) ? markerHit.userData.index : null;
     const item = Number.isInteger(nextIndex) ? missionItems[nextIndex] : null;
 
-    if (!Number.isInteger(nextIndex) || !itemCanUseMapCoordinate(item)) {
+    if (!Number.isInteger(nextIndex) || !itemCanInteractOnMap(item)) {
       if (Number.isInteger(hoveredMissionIndexRef.current)) {
         hideMissionInfoSprite(hoveredMissionIndexRef.current);
       }
@@ -1206,11 +1976,13 @@ const MissionMap = memo(function MissionMap({
     textureLoaderRef.current = new THREE.TextureLoader();
     textureLoaderRef.current.setCrossOrigin("anonymous");
     raycasterRef.current = new THREE.Raycaster();
+    setSceneReadyVersion((version) => version + 1);
 
     updateCameraView();
 
-    function animate() {
+    function animate(timestampMs = performance.now()) {
       animationFrameRef.current = window.requestAnimationFrame(animate);
+      updateDroneAnimatedFrame(timestampMs);
       renderer.render(scene, camera);
     }
     animate();
@@ -1269,8 +2041,14 @@ const MissionMap = memo(function MissionMap({
     };
 
     const tileCoordinates = [baseCoordinate];
+    if (hasLivePosition) {
+      tileCoordinates.push({
+        latitude_deg: Number(livePosition.latitude_deg),
+        longitude_deg: Number(livePosition.longitude_deg),
+      });
+    }
     missionItems.forEach((item, index) => {
-      const coordinate = getMissionMarkerCoordinate(item, index, missionItems, null);
+      const coordinate = getMissionMarkerCoordinate(item, index, missionItems, livePosition, homeCoordinate);
       if (coordinate && hasValidCoordinate(coordinate.latitude_deg, coordinate.longitude_deg)) {
         tileCoordinates.push(coordinate);
       }
@@ -1331,22 +2109,101 @@ const MissionMap = memo(function MissionMap({
     const markerPositions = [];
     let waypointOrder = 0;
     const nextMissionObjects = new Map();
+    const { summaryByWaypointIndex, parentByActionIndex } = buildWaypointActionSummary(missionItems);
+
+    function addGroundActionBadge(actionIndex, coordinate, kind, parentLocal = null) {
+      if (!coordinate || !hasValidCoordinate(coordinate.latitude_deg, coordinate.longitude_deg)) {
+        return;
+      }
+      const local = parentLocal ?? coordinateToSceneMeters(coordinate, baseCoordinate);
+      const isActiveRuntimeItem = currentMissionItemIndex === actionIndex || activeMissionDisplayIndex === actionIndex;
+      const isSelected = selectedIndex === actionIndex || isActiveRuntimeItem;
+      const item = missionItems[actionIndex];
+      const badgeGroup = new THREE.Group();
+      badgeGroup.position.set(local.x, 0.92, local.z);
+      badgeGroup.userData = { type: "mission", index: actionIndex, altitudeY: 0.92 };
+      objectGroup.add(badgeGroup);
+
+      const isLand = kind === "land";
+      const badge = createCircleActionSprite(THREE, isLand ? "↓" : "↩", {
+        background: isLand ? "rgba(76, 29, 149, 0.94)" : "rgba(136, 19, 55, 0.94)",
+        border: isSelected ? "rgba(255,255,255,0.96)" : (isLand ? "rgba(221,214,254,0.78)" : "rgba(254,205,211,0.78)"),
+        color: "#ffffff",
+        scale: 0.030,
+        fontSize: isLand ? 72 : 66,
+      });
+      badge.userData = { type: "mission", index: actionIndex };
+      badge.renderOrder = 45;
+      badgeGroup.add(badge);
+
+      if (isSelected) {
+        const selectedDisk = new THREE.Mesh(
+          new THREE.CylinderGeometry(2.85, 2.85, 0.05, 48),
+          new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.18, depthTest: false }),
+        );
+        selectedDisk.position.y = -0.42;
+        selectedDisk.userData = { type: "mission", index: actionIndex };
+        badgeGroup.add(selectedDisk);
+      }
+
+      nextMissionObjects.set(actionIndex, {
+        group: badgeGroup,
+        altitudeY: 0.92,
+        markerInfo: { x: local.x, y: 0.92, z: local.z, index: actionIndex, item, label: MISSION_LABEL[item?.type] ?? kind.toUpperCase(), waypointOrder },
+        infoSprite: null,
+      });
+    }
 
     missionItems.forEach((item, index) => {
+      if (item.type === "hold" || item.type === "land") {
+        return;
+      }
+
       if (item.type === "waypoint") {
         waypointOrder += 1;
       }
-      const coordinate = getMissionMarkerCoordinate(item, index, missionItems, null);
+      const coordinate = getMissionMarkerCoordinate(item, index, missionItems, livePosition, homeCoordinate);
       if (!coordinate || !hasValidCoordinate(coordinate.latitude_deg, coordinate.longitude_deg)) {
         return;
       }
       const local = coordinateToSceneMeters(coordinate, baseCoordinate);
-      const altitudeM = getVisualAltitudeM(item, null);
+
+      if (item.type === "rtl") {
+        addGroundActionBadge(index, coordinate, "rtl", local);
+        markerPositions.push({ x: local.x, y: 0.92, z: local.z, index, item, label: "RTL", waypointOrder });
+        return;
+      }
+
+      const baseAltitudeM = getBaseVisualAltitudeM(item, livePosition);
+      let altitudeM = getVisualAltitudeM(item, livePosition, missionAltitudeOffsetM);
+      if (item.type === "takeoff") {
+        altitudeM = Number.isFinite(Number(item.altitude_m)) ? Math.max(0, Number(item.altitude_m)) : 0;
+      }
       const altitudeY = Math.max(0.65, altitudeM);
+      const attachedSummary = summaryByWaypointIndex.get(index);
+      const attachedActionSelected = parentByActionIndex.get(selectedIndex) === index;
+      const isActiveRuntimeItem = activeMissionDisplayIndex === index;
+      const waypointHasHold = Boolean(item.type === "waypoint" && attachedSummary?.hasHold);
+      const waypointHasLand = Boolean(item.type === "waypoint" && attachedSummary?.hasLand);
       const label = item.type === "waypoint" ? `WP${waypointOrder}` : MISSION_LABEL[item.type] ?? item.type.toUpperCase();
-      const color = colorByType[item.type] ?? colorByType.waypoint;
-      const isSelected = selectedIndex === index;
-      const radius = item.type === "takeoff" || item.type === "land" ? 1.22 : 1.05;
+      const labelAltitudeText = item.type === "takeoff" && Number.isFinite(Number(item.altitude_m))
+        ? `target ${formatAltitudeLabel(item.altitude_m)}`
+        : (item.type === "waypoint" && missionAltitudeOffsetActive
+          ? `${formatAltitudeLabel(altitudeM)} (${missionAltitudeOffsetM > 0 ? "+" : ""}${missionAltitudeOffsetM.toFixed(1)} m)`
+          : formatAltitudeLabel(altitudeM));
+      let color = colorByType[item.type] ?? colorByType.waypoint;
+      if (item.type === "waypoint") {
+        if (waypointHasHold && waypointHasLand) {
+          color = 0xfb923c;
+        } else if (waypointHasHold) {
+          color = 0xfacc15;
+        } else if (waypointHasLand) {
+          color = 0xa78bfa;
+        }
+      }
+      const isSelected = selectedIndex === index || attachedActionSelected;
+      const isHighlighted = isSelected || index === activeMapPickIndex || isActiveRuntimeItem;
+      const radius = item.type === "takeoff" ? 1.22 : (isActiveRuntimeItem ? 1.22 : 1.05);
 
       const markerGroup = new THREE.Group();
       markerGroup.position.set(local.x, altitudeY, local.z);
@@ -1358,15 +2215,15 @@ const MissionMap = memo(function MissionMap({
         roughness: 0.28,
         metalness: 0.16,
         emissive: color,
-        emissiveIntensity: isSelected || index === activeMapPickIndex ? 0.58 : 0.18,
+        emissiveIntensity: isActiveRuntimeItem ? ACTIVE_MISSION_MARKER_EMISSIVE_INTENSITY : (isSelected || index === activeMapPickIndex ? 0.58 : 0.18),
       });
       const marker = new THREE.Mesh(new THREE.CylinderGeometry(radius, radius, 0.46, 36), markerMaterial);
       marker.userData = { type: "mission", index };
       markerGroup.add(marker);
 
       const ring = new THREE.Mesh(
-        new THREE.TorusGeometry(radius + 0.30, 0.055, 8, 42),
-        new THREE.MeshBasicMaterial({ color, transparent: true, opacity: isSelected || index === activeMapPickIndex ? 0.95 : 0.55 }),
+        new THREE.TorusGeometry(radius + (isActiveRuntimeItem ? ACTIVE_MISSION_MARKER_RING_RADIUS_EXTRA_M : 0.30), isActiveRuntimeItem ? 0.085 : 0.055, 8, 42),
+        new THREE.MeshBasicMaterial({ color, transparent: true, opacity: isHighlighted ? 0.98 : 0.55 }),
       );
       ring.rotation.x = Math.PI / 2;
       ring.userData = { type: "mission", index };
@@ -1381,17 +2238,41 @@ const MissionMap = memo(function MissionMap({
         markerGroup.add(tower);
       }
 
-      const labelSprite = createTextSprite(THREE, `${label}\n${formatAltitudeLabel(altitudeM)}`, {
+      const labelLines = [`${label}`, `${labelAltitudeText}`];
+      if (isActiveRuntimeItem && currentMissionActionLabel) {
+        labelLines.push(currentMissionActionLabel);
+      }
+      if (waypointHasHold) {
+        labelLines.push(formatHoldTimeLabel(attachedSummary.totalHoldTimeS));
+      }
+      if (waypointHasLand) {
+        labelLines.push("LAND");
+      }
+      const waypointActionBackground = waypointHasHold && waypointHasLand
+        ? "rgba(251, 146, 60, 0.94)"
+        : (waypointHasHold ? "rgba(250, 204, 21, 0.94)" : "rgba(34, 211, 238, 0.94)");
+      const labelSprite = createTextSprite(THREE, labelLines.join("\n"), {
         color: item.type === "waypoint" ? "#020617" : "#f8fafc",
         subColor: item.type === "waypoint" ? "#0f172a" : "#e2e8f0",
-        background: item.type === "waypoint" ? "rgba(34, 211, 238, 0.94)" : "rgba(2, 6, 23, 0.88)",
-        border: isSelected || index === activeMapPickIndex ? "rgba(255,255,255,0.90)" : "rgba(255,255,255,0.24)",
+        background: item.type === "waypoint" ? waypointActionBackground : "rgba(2, 6, 23, 0.88)",
+        border: isActiveRuntimeItem ? "rgba(255,255,255,0.98)" : (isSelected || index === activeMapPickIndex ? "rgba(255,255,255,0.90)" : "rgba(255,255,255,0.24)"),
         scale: 0.056,
         fontSize: 32,
       });
       labelSprite.position.set(0, 3.1, 0);
       labelSprite.userData = { type: "mission", index };
       markerGroup.add(labelSprite);
+
+      if (isActiveRuntimeItem) {
+        const activeGlow = new THREE.Mesh(
+          new THREE.CylinderGeometry(radius + ACTIVE_MISSION_MARKER_GLOW_RADIUS_EXTRA_M, radius + ACTIVE_MISSION_MARKER_GLOW_RADIUS_EXTRA_M, 0.10, 64),
+          new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: ACTIVE_MISSION_MARKER_GLOW_OPACITY, depthTest: false }),
+        );
+        activeGlow.position.y = -0.40;
+        activeGlow.renderOrder = 24;
+        activeGlow.userData = { type: "mission", index };
+        markerGroup.add(activeGlow);
+      }
 
       if (coordinate.fromFallback) {
         const fallbackDot = new THREE.Mesh(
@@ -1402,7 +2283,7 @@ const MissionMap = memo(function MissionMap({
         markerGroup.add(fallbackDot);
       }
 
-      if ((isSelected || index === activeMapPickIndex) && itemCanUseMapCoordinate(item)) {
+      if (isHighlighted && itemCanInteractOnMap(item)) {
         const selectedGlow = new THREE.Mesh(
           new THREE.CylinderGeometry(radius + 0.62, radius + 0.62, 0.08, 48),
           new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.14, depthTest: false }),
@@ -1411,12 +2292,15 @@ const MissionMap = memo(function MissionMap({
         selectedGlow.renderOrder = 18;
         selectedGlow.userData = { type: "mission", index };
         markerGroup.add(selectedGlow);
-
       }
 
       const markerInfo = { x: local.x, y: altitudeY, z: local.z, index, item, label, waypointOrder };
       markerPositions.push(markerInfo);
       nextMissionObjects.set(index, { group: markerGroup, altitudeY, markerInfo, infoSprite: null });
+
+      if (waypointHasLand) {
+        attachedSummary.landItems.forEach((landInfo) => addGroundActionBadge(landInfo.index, coordinate, "land", local));
+      }
     });
 
     missionObjectByIndexRef.current = nextMissionObjects;
@@ -1424,15 +2308,46 @@ const MissionMap = memo(function MissionMap({
     missionLineRef.current = null;
 
     if (markerPositions.length > 1) {
-      const lineGeometry = new THREE.BufferGeometry().setFromPoints(markerPositions.map((marker) => new THREE.Vector3(marker.x, marker.y, marker.z)));
-      const lineMaterial = new THREE.LineBasicMaterial({ color: 0x22d3ee, transparent: true, opacity: 0.92 });
-      const line = new THREE.Line(lineGeometry, lineMaterial);
+      const pathPoints = markerPositions.map((marker) => new THREE.Vector3(marker.x, marker.y, marker.z));
+      const lineCurve = new THREE.CatmullRomCurve3(pathPoints, false, "catmullrom", 0.05);
+      const lineGeometry = new THREE.TubeGeometry(
+        lineCurve,
+        Math.max(2, pathPoints.length * 12),
+        MISSION_PATH_LINE_THICKNESS_M,
+        8,
+        false,
+      );
+      const lineMaterial = new THREE.MeshBasicMaterial({
+        color: MISSION_PATH_LINE_COLOR,
+        transparent: true,
+        opacity: MISSION_PATH_LINE_OPACITY,
+        depthWrite: false,
+      });
+      const line = new THREE.Mesh(lineGeometry, lineMaterial);
+      line.renderOrder = 8;
       objectGroup.add(line);
       missionLineRef.current = line;
     }
 
 
-  }, [sceneBaseCoordinate, missionItems, selectedIndex, activeMapPickIndex]);
+  }, [
+    sceneReadyVersion,
+    sceneBaseCoordinate,
+    missionItems,
+    selectedIndex,
+    activeMapPickIndex,
+    hasLivePosition,
+    livePosition.latitude_deg,
+    livePosition.longitude_deg,
+    livePosition.relative_altitude_m,
+    homeCoordinate?.latitude_deg,
+    homeCoordinate?.longitude_deg,
+    missionAltitudeOffsetM,
+    missionAltitudeOffsetActive,
+    currentMissionItemIndex,
+    activeMissionDisplayIndex,
+    currentMissionActionLabel,
+  ]);
 
   useEffect(() => {
     const trackGroup = trackGroupRef.current;
@@ -1456,63 +2371,59 @@ const MissionMap = memo(function MissionMap({
       const trackMaterial = new THREE.LineBasicMaterial({ color: 0x10b981, transparent: true, opacity: 0.90 });
       trackGroup.add(new THREE.Line(trackGeometry, trackMaterial));
     }
-  }, [flightTrack]);
+  }, [sceneReadyVersion, flightTrack]);
 
   useEffect(() => {
     const droneGroup = droneGroupRef.current;
+    const droneVisual = droneVisualRef.current;
     if (!droneGroup) {
       return;
     }
 
-    droneGroup.children.forEach((child) => disposeThreeObject(child));
-    droneGroup.clear();
-
     if (!hasLivePosition) {
+      droneVisual.visible = false;
+      return;
+    }
+
+    const visualGroup = ensureDroneVisual();
+    if (!visualGroup) {
       return;
     }
 
     const local = coordinateToSceneMeters(livePosition, currentBaseCoordinateRef.current);
-    const altitudeM = Number.isFinite(Number(livePosition.relative_altitude_m)) ? Math.max(0.65, Number(livePosition.relative_altitude_m)) : 0.65;
-    const dronePosition = new THREE.Vector3(local.x, altitudeM, local.z);
-    const droneMaterial = new THREE.MeshStandardMaterial({ color: 0x10b981, roughness: 0.2, metalness: 0.22, emissive: 0x10b981, emissiveIntensity: 0.68 });
-    const droneDisk = new THREE.Mesh(new THREE.CylinderGeometry(1.42, 1.42, 0.54, 42), droneMaterial);
-    droneDisk.position.copy(dronePosition);
-    droneGroup.add(droneDisk);
+    const altitudeM = Number.isFinite(Number(livePosition.relative_altitude_m))
+      ? Math.max(0.65, Number(livePosition.relative_altitude_m))
+      : 0.65;
+    const headingDeg = Number.isFinite(Number(droneTelemetry.headingDeg)) ? Number(droneTelemetry.headingDeg) : 0;
 
-    const droneRing = new THREE.Mesh(
-      new THREE.TorusGeometry(2.05, 0.075, 8, 48),
-      new THREE.MeshBasicMaterial({ color: 0x86efac, transparent: true, opacity: 0.82 }),
-    );
-    droneRing.rotation.x = Math.PI / 2;
-    droneRing.position.copy(dronePosition);
-    droneGroup.add(droneRing);
+    droneVisual.visible = true;
+    droneVisual.targetPosition.set(local.x, altitudeM, local.z);
+    droneVisual.targetHeadingRad = (headingDeg * Math.PI) / 180;
 
-    if (altitudeM > 1.2) {
-      const tower = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.095, 0.095, altitudeM, 8),
-        new THREE.MeshBasicMaterial({ color: 0x86efac, transparent: true, opacity: 0.30 }),
-      );
-      tower.position.set(local.x, altitudeM / 2, local.z);
-      droneGroup.add(tower);
+    // Lần đầu hoặc khi map bị rebase thì snap marker vào đúng vị trí mới,
+    // sau đó animation loop sẽ nội suy mượt giữa các gói telemetry tiếp theo.
+    if (!droneVisual.initialized || droneVisual.currentPosition.distanceTo(droneVisual.targetPosition) > 160) {
+      droneVisual.currentPosition.copy(droneVisual.targetPosition);
+      droneVisual.currentHeadingRad = droneVisual.targetHeadingRad;
+      droneVisual.initialized = true;
+      droneVisual.forceSnap = false;
+      visualGroup.position.copy(droneVisual.currentPosition);
     }
 
-    const headingDeg = Number.isFinite(Number(droneTelemetry.headingDeg)) ? Number(droneTelemetry.headingDeg) : 0;
-    const headingRad = (headingDeg * Math.PI) / 180;
-    const headingVector = new THREE.Vector3(Math.sin(headingRad), 0, -Math.cos(headingRad)).normalize();
-    const arrow = new THREE.ArrowHelper(headingVector, dronePosition.clone().add(new THREE.Vector3(0, 0.76, 0)), 4.5, 0xf0fdf4, 1.25, 0.72);
-    droneGroup.add(arrow);
+    updateDroneLabel(altitudeM);
+    updateDroneTower(altitudeM);
+  }, [
+    sceneReadyVersion,
+    sceneBaseCoordinate.latitude_deg,
+    sceneBaseCoordinate.longitude_deg,
+    hasLivePosition,
+    livePosition.latitude_deg,
+    livePosition.longitude_deg,
+    livePosition.relative_altitude_m,
+    livePosition.altitude_amsl_m,
+    droneTelemetry.headingDeg,
+  ]);
 
-    const droneLabel = createTextSprite(THREE, `UAV\n${formatAltitudeLabel(altitudeM)}`, {
-      color: "#ecfdf5",
-      subColor: "#bbf7d0",
-      background: "rgba(2, 6, 23, 0.92)",
-      border: "rgba(134,239,172,0.82)",
-      scale: 0.056,
-      fontSize: 32,
-    });
-    droneLabel.position.set(local.x, altitudeM + 3.8, local.z);
-    droneGroup.add(droneLabel);
-  }, [hasLivePosition, livePosition.latitude_deg, livePosition.longitude_deg, livePosition.relative_altitude_m, livePosition.altitude_amsl_m, droneTelemetry.headingDeg]);
 
 
 
@@ -1524,6 +2435,40 @@ const MissionMap = memo(function MissionMap({
     const local = coordinateToSceneMeters(livePosition, currentBaseCoordinateRef.current);
     setCameraTarget(new THREE.Vector3(local.x, 0, local.z), 170);
   }
+
+  // Camera is intentionally manual.
+  // Live telemetry only moves the UAV marker; it must not force the 3D camera
+  // to follow/zoom because that locks the operator out of planning and dragging.
+
+  useEffect(() => {
+    if (!hasLivePosition) {
+      return;
+    }
+
+    // Rebase map tiles if the UAV gets far from the current map origin.
+    // This changes only the local coordinate frame/tile origin; it does not
+    // move or zoom the 3D camera. Use the Center UAV button for manual centering.
+    const oldBase = currentBaseCoordinateRef.current;
+    const local = coordinateToSceneMeters(livePosition, oldBase);
+    const distanceFromBase = Math.hypot(local.x, local.z);
+    if (!baseInitializedRef.current || distanceFromBase > 80) {
+      const previousCameraTargetCoordinate = sceneMetersToCoordinate(
+        cameraControlRef.current.target.x,
+        cameraControlRef.current.target.z,
+        oldBase,
+      );
+      const nextBase = {
+        latitude_deg: Number(livePosition.latitude_deg),
+        longitude_deg: Number(livePosition.longitude_deg),
+      };
+      const preservedCameraTarget = coordinateToSceneMeters(previousCameraTargetCoordinate, nextBase);
+      baseInitializedRef.current = true;
+      currentBaseCoordinateRef.current = nextBase;
+      cameraControlRef.current.target.set(preservedCameraTarget.x, cameraControlRef.current.target.y, preservedCameraTarget.z);
+      updateCameraView();
+      setSceneBaseCoordinate(nextBase);
+    }
+  }, [hasLivePosition, livePosition.latitude_deg, livePosition.longitude_deg]);
 
   function fitWaypoints() {
     const points = [...markerPositionsRef.current];
@@ -1557,7 +2502,8 @@ const MissionMap = memo(function MissionMap({
       const entry = missionObjectByIndexRef.current.get(index);
       const groundPoint = screenPointToGround(event);
       const canDragMap = itemCanUseMapCoordinate(item);
-      const dragMode = canDragMap ? "marker-combo-drag" : "marker-select";
+      const canDragAltitude = itemCanDragAltitude(item);
+      const dragMode = canDragMap || canDragAltitude ? "marker-combo-drag" : "marker-select";
       const currentAltitude = Number.isFinite(Number(item?.altitude_m)) ? Number(item.altitude_m) : (entry?.altitudeY ?? 0);
 
       pointerRef.current = {
@@ -1576,7 +2522,7 @@ const MissionMap = memo(function MissionMap({
         dragGesture: null,
       };
 
-      if (canDragMap && entry) {
+      if ((canDragMap || canDragAltitude) && entry) {
         hoveredMissionIndexRef.current = index;
         const coordinate = sceneMetersToCoordinate(entry.group.position.x, entry.group.position.z, currentBaseCoordinateRef.current);
         showMissionInfoSprite(index, {
@@ -1639,8 +2585,14 @@ const MissionMap = memo(function MissionMap({
       const totalAbsX = Math.abs(totalDx);
       const totalAbsY = Math.abs(totalDy);
 
+      const draggedItem = missionItems[pointer.selectedIndex];
+      const canMoveOnMap = itemCanUseMapCoordinate(draggedItem);
+      const canDragAltitude = itemCanDragAltitude(draggedItem);
+
       if (!pointer.dragGesture && totalAbsX + totalAbsY > 7) {
-        pointer.dragGesture = totalAbsY > totalAbsX * 1.15 ? "altitude" : "xy";
+        pointer.dragGesture = !canMoveOnMap && canDragAltitude
+          ? "altitude"
+          : (totalAbsY > totalAbsX * 1.15 ? "altitude" : "xy");
       }
 
       if (pointer.dragGesture === "altitude") {
@@ -1650,6 +2602,10 @@ const MissionMap = memo(function MissionMap({
         if (preview) {
           pointer.draftCoordinate = preview;
         }
+        return;
+      }
+
+      if (!canMoveOnMap) {
         return;
       }
 
@@ -1702,8 +2658,13 @@ const MissionMap = memo(function MissionMap({
     }
 
     if (pointer.mode === "marker-combo-drag" && pointer.moved && Number.isInteger(pointer.selectedIndex) && pointer.draftCoordinate) {
+      const selectedItem = missionItems[pointer.selectedIndex];
       const updateOptions = pointer.dragGesture === "altitude"
-        ? { altitude_m: pointer.draftCoordinate.altitude_m, silent: false }
+        ? {
+            altitude_m: pointer.draftCoordinate.altitude_m,
+            onlyAltitude: !itemCanUseMapCoordinate(selectedItem),
+            silent: false,
+          }
         : { silent: false };
       onUpdateWaypointFromMap(
         pointer.selectedIndex,
@@ -1768,8 +2729,20 @@ const MissionMap = memo(function MissionMap({
         <Icon name="deployed_code" className="text-[17px]" />
         3D Mission Map
       </div>
+      <div className="pointer-events-none absolute left-5 top-[56px] z-10 grid gap-1 rounded-2xl border border-emerald-300/20 bg-zinc-950/62 px-3 py-2 text-[11px] font-bold text-zinc-200 shadow-xl backdrop-blur-sm">
+        <div className="flex items-center gap-2 text-emerald-100">
+          <Icon name="my_location" className="text-[16px]" />
+          <span>UAV {hasLivePosition ? livePosition.source : "no position"}</span>
+        </div>
+        <div className="font-mono text-zinc-300">
+          Lat {formatCoordinate(livePosition.latitude_deg)} · Lon {formatCoordinate(livePosition.longitude_deg)}
+        </div>
+        <div className="font-mono text-zinc-400">
+          X {formatSmallNumber(livePosition.local_x_ned_m, 2, " m")} · Y {formatSmallNumber(livePosition.local_y_ned_m, 2, " m")} · Z {formatSmallNumber(livePosition.local_z_ned_m, 2, " m")}
+        </div>
+      </div>
       {hasActiveMapPick ? (
-        <div className="pointer-events-none absolute left-5 top-[56px] z-10 rounded-2xl border border-amber-300/35 bg-amber-400/12 px-3 py-2 text-xs font-bold text-amber-50 shadow-xl backdrop-blur-sm">
+        <div className="pointer-events-none absolute left-5 top-[145px] z-10 rounded-2xl border border-amber-300/35 bg-amber-400/12 px-3 py-2 text-xs font-bold text-amber-50 shadow-xl backdrop-blur-sm">
           Chọn vị trí step #{activeMapPickIndex + 1}: click mặt sàn hoặc kéo marker.
         </div>
       ) : null}
@@ -1797,6 +2770,8 @@ function MissionItemRow({
   index,
   expanded,
   dragOver,
+  activeRuntimeItem,
+  currentRuntimeActionLabel,
   compactInputClass,
   onSelect,
   onChange,
@@ -1810,7 +2785,12 @@ function MissionItemRow({
   const hasMapCoordinate = itemCanUseMapCoordinate(item);
   const isHold = item.type === "hold";
   const isTakeoff = item.type === "takeoff";
+  const isLand = item.type === "land";
   const isRtl = item.type === "rtl";
+  const isChangeSettings = item.type === "changeSettings";
+  const isPickup = item.type === "pickup";
+  const isServoPulse = item.type === "servoPulse";
+  const isCustomAction = item.type === "customAction";
 
   return (
     <div
@@ -1818,11 +2798,13 @@ function MissionItemRow({
       onDrop={(event) => onDrop(event, index)}
       onDragEnd={onDragEnd}
       className={`overflow-hidden rounded-3xl border transition ${
-        expanded
-          ? "border-cyan-300/60 bg-cyan-400/[0.10] shadow-[0_18px_45px_rgba(34,211,238,0.10)]"
-          : dragOver
-            ? "border-amber-300/70 bg-amber-400/[0.10]"
-            : "border-white/10 bg-zinc-950/62 hover:bg-white/[0.08]"
+        activeRuntimeItem
+          ? "border-emerald-200/80 bg-emerald-400/[0.13] shadow-[0_18px_50px_rgba(52,211,153,0.16)]"
+          : expanded
+            ? "border-cyan-300/60 bg-cyan-400/[0.10] shadow-[0_18px_45px_rgba(34,211,238,0.10)]"
+            : dragOver
+              ? "border-amber-300/70 bg-amber-400/[0.10]"
+              : "border-white/10 bg-zinc-950/62 hover:bg-white/[0.08]"
       }`}
     >
       <button type="button" onClick={() => onSelect(index)} className="w-full px-3 py-3 text-left">
@@ -1840,14 +2822,25 @@ function MissionItemRow({
           <div className="min-w-0 flex-1">
             <div className="flex items-center justify-between gap-3">
               <strong className="truncate text-sm text-zinc-100">{item.name || item.type}</strong>
-              <span className="rounded-full bg-white/8 px-2 py-1 text-[10px] font-black text-zinc-300">#{index + 1}</span>
+              <span className={`rounded-full px-2 py-1 text-[10px] font-black ${activeRuntimeItem ? "bg-emerald-300 text-zinc-950" : "bg-white/8 text-zinc-300"}`}>{activeRuntimeItem ? "RUN" : `#${index + 1}`}</span>
             </div>
             <div className="mt-1 flex items-center gap-2 text-[11px] text-zinc-500">
               <Icon name="drag_indicator" className="text-[16px]" />
               <span>{item.type.toUpperCase()}</span>
               {hasMapCoordinate ? <span className="truncate">· {formatCoordinate(item.latitude_deg)}, {formatCoordinate(item.longitude_deg)}</span> : null}
               {isTakeoff ? <span className="truncate">· target {formatAltitudeLabel(item.altitude_m)} AGL</span> : null}
+              {isHold ? <span className="truncate">· {formatHoldTimeLabel(item.hold_time_s)} sau WP trước</span> : null}
+              {isLand ? <span className="truncate">· gắn dưới WP trước</span> : null}
+              {isPickup ? <span className="truncate">· payload {item.custom_json || "{}"}</span> : null}
+              {isServoPulse ? <span className="truncate">· CH {item.servo_channel ?? "--"} PWM {item.servo_pwm_on_us ?? "--"}</span> : null}
+              {isCustomAction ? <span className="truncate">· {item.custom_type || "customAction"}</span> : null}
             </div>
+            {activeRuntimeItem ? (
+              <div className="mt-2 inline-flex max-w-full items-center gap-1 rounded-full border border-emerald-200/50 bg-emerald-300/18 px-2 py-1 text-[10px] font-black uppercase tracking-[0.08em] text-emerald-50">
+                <Icon name="play_arrow" className="text-[14px]" />
+                <span className="truncate">{currentRuntimeActionLabel || "ĐANG THỰC HIỆN"}</span>
+              </div>
+            ) : null}
           </div>
           <Icon name="keyboard_arrow_down" className={`text-[26px] text-zinc-400 transition ${expanded ? "rotate-180" : ""}`} />
         </div>
@@ -1879,7 +2872,7 @@ function MissionItemRow({
                 <input value={item.altitude_m} onChange={(event) => onChange(index, "altitude_m", event.target.value)} className={compactInputClass} />
               </Field>
               <div className="rounded-2xl border border-emerald-300/20 bg-emerald-400/10 px-3 py-3 text-xs font-semibold text-emerald-100">
-                Takeoff chỉ dùng độ cao tương đối. Node sẽ tự cộng với AMSL hiện tại của drone trước khi gửi lệnh takeoff sang PX4.
+                Takeoff dùng độ cao tương đối so với home và chạy qua PX4 takeoff mode.
               </div>
             </>
           ) : hasMapCoordinate ? (
@@ -1892,7 +2885,7 @@ function MissionItemRow({
                   <input value={item.longitude_deg} onChange={(event) => onChange(index, "longitude_deg", event.target.value)} className={compactInputClass} />
                 </Field>
               </div>
-              <Field label="Alt AMSL (m)">
+              <Field label="Relative Alt (m AGL)">
                 <input value={item.altitude_m} onChange={(event) => onChange(index, "altitude_m", event.target.value)} className={compactInputClass} />
               </Field>
               <div className="grid grid-cols-2 gap-2">
@@ -1900,10 +2893,77 @@ function MissionItemRow({
                 <GlassButton icon="open_with" label="Drag on map" tone="amber" onClick={() => onSelect(index)} />
               </div>
             </>
+          ) : isHold ? (
+            <div className="rounded-2xl border border-amber-300/20 bg-amber-400/10 px-3 py-3 text-xs font-semibold leading-5 text-amber-100">
+              Hold là action gắn vào waypoint đứng ngay trước nó. Trên map, waypoint đó sẽ đổi màu và hiển thị thời gian hold; không vẽ Hold như một waypoint độc lập.
+            </div>
+          ) : isLand ? (
+            <div className="rounded-2xl border border-violet-300/20 bg-violet-400/10 px-3 py-3 text-xs font-semibold leading-5 text-violet-100">
+              Land là action gắn vào waypoint đứng ngay trước nó. Trên map chỉ hiện icon tròn 2D ở dưới waypoint đó, không vẽ label 3D riêng.
+            </div>
           ) : isRtl ? (
             <div className="rounded-2xl border border-rose-300/20 bg-rose-400/10 px-3 py-3 text-xs font-semibold text-rose-100">
-              RTL không cần nhập tọa độ. Icon RTL được neo ngay tại vị trí drone hiện tại; nếu chưa có GPS live thì mới fallback về tọa độ đầu mission.
+              RTL không cần nhập tọa độ. Trên map chỉ hiện icon tròn 2D tại HOME/local reference, không chạy theo vị trí hoặc độ cao UAV đang bay.
             </div>
+          ) : isChangeSettings ? (
+            <>
+              <label className="flex items-center gap-2 rounded-2xl border border-white/10 bg-zinc-950/55 px-3 py-3 text-xs font-bold text-zinc-200">
+                <input
+                  type="checkbox"
+                  checked={Boolean(item.reset_all)}
+                  onChange={(event) => onChange(index, "reset_all", event.target.checked)}
+                  className="h-4 w-4 accent-cyan-400"
+                />
+                Reset all settings before applying values
+              </label>
+              <div className="grid grid-cols-3 gap-2">
+                <Field label="H Vel">
+                  <input value={item.horizontal_velocity_m_s ?? ""} onChange={(event) => onChange(index, "horizontal_velocity_m_s", event.target.value)} className={compactInputClass} />
+                </Field>
+                <Field label="V Vel">
+                  <input value={item.vertical_velocity_m_s ?? ""} onChange={(event) => onChange(index, "vertical_velocity_m_s", event.target.value)} className={compactInputClass} />
+                </Field>
+                <Field label="Yaw">
+                  <input value={item.max_heading_rate_deg_s ?? ""} onChange={(event) => onChange(index, "max_heading_rate_deg_s", event.target.value)} className={compactInputClass} />
+                </Field>
+              </div>
+            </>
+          ) : isPickup ? (
+            <>
+              <Field label="Pickup Payload JSON">
+                <textarea value={item.custom_json ?? "{}"} onChange={(event) => onChange(index, "custom_json", event.target.value)} className={`${compactInputClass} min-h-[96px] resize-y font-mono text-xs`} />
+              </Field>
+              <div className="rounded-2xl border border-orange-300/20 bg-orange-400/10 px-3 py-3 text-xs font-semibold text-orange-100">
+                ROS mode mới chỉ đăng ký custom action pickup. Payload này sẽ được publish ra /adaptive_mission_mode/pickup khi executor chạy tới step.
+              </div>
+            </>
+          ) : isServoPulse ? (
+            <div className="grid grid-cols-2 gap-2">
+              <Field label="Channel">
+                <input value={item.servo_channel ?? 1} onChange={(event) => onChange(index, "servo_channel", event.target.value)} className={compactInputClass} />
+              </Field>
+              <Field label="PWM On">
+                <input value={item.servo_pwm_on_us ?? 1900} onChange={(event) => onChange(index, "servo_pwm_on_us", event.target.value)} className={compactInputClass} />
+              </Field>
+              <Field label="PWM Off">
+                <input value={item.servo_pwm_off_us ?? 1500} onChange={(event) => onChange(index, "servo_pwm_off_us", event.target.value)} className={compactInputClass} />
+              </Field>
+              <Field label="Period (s)">
+                <input value={item.servo_period_s ?? 0.5} onChange={(event) => onChange(index, "servo_period_s", event.target.value)} className={compactInputClass} />
+              </Field>
+              <Field label="On Time (s)">
+                <input value={item.servo_on_duration_s ?? 0.2} onChange={(event) => onChange(index, "servo_on_duration_s", event.target.value)} className={compactInputClass} />
+              </Field>
+            </div>
+          ) : isCustomAction ? (
+            <>
+              <Field label="Action Type">
+                <input value={item.custom_type ?? "customAction"} onChange={(event) => onChange(index, "custom_type", event.target.value)} className={compactInputClass} />
+              </Field>
+              <Field label="Action JSON">
+                <textarea value={item.custom_json ?? "{}"} onChange={(event) => onChange(index, "custom_json", event.target.value)} className={`${compactInputClass} min-h-[96px] resize-y font-mono text-xs`} />
+              </Field>
+            </>
           ) : (
             <div className="rounded-2xl border border-white/10 bg-white/5 px-3 py-3 text-xs font-semibold text-zinc-300">
               Item này không cần tham số bổ sung.
@@ -1940,8 +3000,9 @@ function MissionPanel({
   onClearMapPick,
   onClearMissionItems,
   onSave,
-  onActivate,
   onRun,
+  onPauseContinue,
+  onAbort,
   onAppendItem,
   onAppendWaypointFromMap,
   onUpdateMissionItem,
@@ -1953,6 +3014,10 @@ function MissionPanel({
   onItemDrop,
   onItemDragEnd,
   missionRuntime,
+  pauseControl,
+  currentMissionItemIndex,
+  activeMissionDisplayIndex,
+  currentMissionActionLabel,
 }) {
   if (!open) {
     return (
@@ -1961,6 +3026,10 @@ function MissionPanel({
       </div>
     );
   }
+
+  const pauseButtonLabel = pauseControl?.isPausedWorkflow ? "Continue" : "Pause-RTL";
+  const pauseButtonIcon = pauseControl?.isPausedWorkflow ? "play_circle" : "keyboard_return";
+  const pauseButtonBusy = busyAction === "pause-rtl" || busyAction === "continue";
 
   return (
     <aside className="pointer-events-auto absolute bottom-4 left-4 top-4 z-40 flex w-[390px] max-w-[calc(100vw-2rem)] flex-col overflow-hidden rounded-[34px] border border-white/15 bg-zinc-950/[0.84] shadow-[0_28px_85px_rgba(0,0,0,0.55)] backdrop-blur-sm">
@@ -1978,35 +3047,23 @@ function MissionPanel({
           <MiniIconButton icon="keyboard_double_arrow_left" label="Collapse" onClick={onClose} />
         </div>
 
-        <div className="mt-4 flex items-center gap-2 rounded-3xl border border-white/10 bg-white/[0.045] p-1.5">
-          <GlassButton icon="save" label={busyAction === "save" ? "Saving" : "Save"} tone="cyan" disabled={busyAction !== "" || missionItems.length === 0} onClick={onSave} />
-          <GlassButton icon="play_arrow" label={busyAction === "activate" ? "Sending" : "Start"} tone="amber" disabled={busyAction !== ""} onClick={onActivate} />
-          <GlassButton icon="rocket_launch" label={busyAction === "run" ? "Run" : "Run"} tone="emerald" disabled={busyAction !== "" || missionItems.length === 0} onClick={onRun} />
-          <div className="ml-auto">
+        <div className="mt-4 grid grid-cols-2 gap-2 rounded-3xl border border-white/10 bg-white/[0.045] p-1.5">
+          <GlassButton className="min-h-[44px] w-full" icon="upload" label={busyAction === "save" ? "Uploading" : "Upload"} tone="cyan" disabled={busyAction !== "" || missionItems.length === 0} onClick={onSave} />
+          <GlassButton className="min-h-[44px] w-full" icon="rocket_launch" label={busyAction === "run" ? "Running" : "Run"} tone="emerald" disabled={busyAction !== "" || missionItems.length === 0} onClick={onRun} />
+          <GlassButton className="min-h-[48px] w-full" icon={pauseButtonIcon} label={pauseButtonBusy ? "Sending" : pauseButtonLabel} tone={pauseControl?.isPausedWorkflow ? "emerald" : "amber"} disabled={busyAction !== ""} onClick={onPauseContinue} />
+          <GlassButton className="min-h-[48px] w-full" icon="stop_circle" label={busyAction === "abort" ? "Stopping" : "Stop"} tone="rose" disabled={busyAction !== ""} onClick={onAbort} />
+          <div className="col-span-2 flex justify-end">
             <MiniIconButton icon="delete_sweep" label="Xóa toàn bộ danh sách mission" disabled={missionItems.length === 0 || busyAction !== ""} onClick={onClearMissionItems} />
           </div>
         </div>
         {Number.isInteger(activeMapPickIndex) ? (
-          <div className="mt-3 grid gap-2 rounded-2xl border border-amber-300/35 bg-amber-400/12 px-3 py-3 text-sm font-bold text-amber-50">
-            <div className="flex items-center gap-2">
-              <Icon name="edit_location_alt" className="text-[22px]" />
-              <span>Đang chọn vị trí cho step #{activeMapPickIndex + 1}</span>
-            </div>
-            <button
-              type="button"
-              onPointerDown={(event) => event.stopPropagation()}
-              onClick={(event) => {
-                event.stopPropagation();
-                onClearMapPick();
-              }}
-              className="rounded-xl border border-white/10 bg-zinc-950/55 px-3 py-2 text-xs font-black text-zinc-100 transition hover:bg-white/10"
-            >
-              Tắt chế độ chọn vị trí
-            </button>
+          <div className="mt-3 flex items-center gap-2 rounded-2xl border border-amber-300/35 bg-amber-400/12 px-3 py-3 text-sm font-bold text-amber-50">
+            <Icon name="edit_location_alt" className="text-[22px]" />
+            <span>Đang chọn vị trí cho step #{activeMapPickIndex + 1}. Dùng nút X trên map để tắt.</span>
           </div>
         ) : (
           <div className="mt-3 rounded-2xl border border-white/10 bg-white/[0.055] px-3 py-3 text-xs font-semibold leading-5 text-zinc-300">
-            Nhấn WP/Hold/Land để tạo step mới rồi click lên map 3D để đặt tọa độ. Click lại marker hoặc dòng step để mở và kéo thả trực tiếp.
+            Nhấn WP để tạo waypoint rồi click lên map 3D để đặt tọa độ. Hold/Land là action gắn vào waypoint đứng trước; RTL hiện bằng icon 2D tại HOME.
           </div>
         )}
       </div>
@@ -2022,6 +3079,22 @@ function MissionPanel({
               <div className="rounded-2xl border border-white/10 bg-zinc-950/55 px-3 py-2">
                 <p className="text-zinc-500">Mission Active</p>
                 <p className="mt-1 font-bold text-zinc-100">{missionRuntime.mission_active ? "YES" : "NO"}</p>
+              </div>
+              <div className="rounded-2xl border border-white/10 bg-zinc-950/55 px-3 py-2">
+                <p className="text-zinc-500">Ready</p>
+                <p className="mt-1 font-bold text-zinc-100">{missionRuntime.mission_ready ? "YES" : "NO"}</p>
+              </div>
+              <div className="rounded-2xl border border-white/10 bg-zinc-950/55 px-3 py-2">
+                <p className="text-zinc-500">Start</p>
+                <p className="mt-1 font-bold text-zinc-100">{missionRuntime.mission_start_in_progress ? "PENDING" : "IDLE"}</p>
+              </div>
+              <div className="rounded-2xl border border-white/10 bg-zinc-950/55 px-3 py-2">
+                <p className="text-zinc-500">Current Item</p>
+                <p className="mt-1 truncate font-bold text-zinc-100">#{missionRuntime.current_item_index ?? "--"} {missionRuntime.current_item_type ?? ""}</p>
+              </div>
+              <div className="rounded-2xl border border-white/10 bg-zinc-950/55 px-3 py-2">
+                <p className="text-zinc-500">Nav State</p>
+                <p className="mt-1 font-bold text-zinc-100">{missionRuntime.vehicle?.nav_state ?? "--"}</p>
               </div>
             </div>
 
@@ -2055,13 +3128,15 @@ function MissionPanel({
                 WP tại UAV
               </button>
             </div>
-            <div className="grid grid-cols-5 gap-1.5">
+            <div className="grid grid-cols-4 gap-1.5">
               {[
                 ["takeoff", "flight_takeoff", "TO"],
                 ["waypoint", "add_location_alt", "WP"],
                 ["hold", "pause_circle", "Hold"],
+                ["changeSettings", "tune", "Set"],
                 ["land", "flight_land", "Land"],
                 ["rtl", "home_pin", "RTL"],
+                ["pickup", "inventory_2", "Pickup"],
               ].map(([type, icon, label]) => (
                 <button key={type} type="button" onClick={() => onAppendItem(type)} className="grid gap-1 rounded-2xl border border-white/10 bg-zinc-900/70 px-1.5 py-2 text-center text-[10px] font-black text-zinc-200 transition hover:border-cyan-300/40 hover:bg-cyan-400/10">
                   <Icon name={icon} className="mx-auto text-[20px]" />
@@ -2087,6 +3162,8 @@ function MissionPanel({
                   index={index}
                   expanded={selectedMissionIndex === index}
                   dragOver={dragOverIndex === index && draggedIndex !== index}
+                  activeRuntimeItem={activeMissionDisplayIndex === index || currentMissionItemIndex === index}
+                  currentRuntimeActionLabel={currentMissionActionLabel}
                   compactInputClass={compactInputClass}
                   onSelect={onSelectMissionIndex}
                   onChange={onUpdateMissionItem}
@@ -2170,7 +3247,7 @@ function DroneStatusPanel({
             </div>
             <div className="min-w-0">
               <h2 className="truncate text-lg font-black tracking-[-0.04em] text-zinc-50">{drone.armed ? "ARMED" : "DISARMED"}</h2>
-              <p className="text-xs text-zinc-400">{loading ? "Polling..." : drone.connected ? "MAVLink live" : "MAVLink stale"}</p>
+              <p className="text-xs text-zinc-400">{loading ? "Polling..." : drone.connected ? `${drone.source} live` : `${drone.source} stale`}</p>
             </div>
           </div>
           <MiniIconButton icon="keyboard_double_arrow_right" label="Collapse" onClick={onClose} />
@@ -2221,7 +3298,7 @@ function DroneStatusPanel({
 
         <div className="mt-3 grid grid-cols-2 gap-3">
           <DroneStatCard icon="explore" value={drone.headingDeg == null ? "--" : `${Number(drone.headingDeg).toFixed(0)}°`} caption="Heading" tone="cyan" />
-          <DroneStatCard icon="height" value={formatSmallNumber(livePositionForStatus.relative_altitude_m ?? livePositionForStatus.altitude_amsl_m, 2, " m")} caption="Altitude" tone="zinc" />
+          <DroneStatCard icon="height" value={formatSmallNumber(livePositionForStatus.relative_altitude_m ?? (Number.isFinite(Number(livePositionForStatus.local_z_ned_m)) ? -Number(livePositionForStatus.local_z_ned_m) : livePositionForStatus.altitude_amsl_m), 2, " m")} caption="Altitude" tone="zinc" />
           <DroneStatCard icon="schedule" value={formatAge(drone.heartbeatAge)} caption="Heartbeat" tone="zinc" />
         </div>
 
@@ -2229,7 +3306,7 @@ function DroneStatusPanel({
           <div className="flex items-center gap-3">
             <Icon name="gps_fixed" className="text-[24px] text-emerald-100" />
             <div>
-              <h3 className="text-sm font-black text-zinc-100">GPS</h3>
+              <h3 className="text-sm font-black text-zinc-100">Position</h3>
               <p className="text-xs text-zinc-500">{livePositionForStatus.source}</p>
             </div>
           </div>
@@ -2237,6 +3314,9 @@ function DroneStatusPanel({
             <div className="flex justify-between gap-3"><span className="text-zinc-500">Lat</span><span>{formatCoordinate(livePositionForStatus.latitude_deg)}</span></div>
             <div className="flex justify-between gap-3"><span className="text-zinc-500">Lon</span><span>{formatCoordinate(livePositionForStatus.longitude_deg)}</span></div>
             <div className="flex justify-between gap-3"><span className="text-zinc-500">AMSL</span><span>{formatSmallNumber(livePositionForStatus.altitude_amsl_m, 2, " m")}</span></div>
+            <div className="flex justify-between gap-3"><span className="text-zinc-500">Local X</span><span>{formatSmallNumber(livePositionForStatus.local_x_ned_m, 2, " m")}</span></div>
+            <div className="flex justify-between gap-3"><span className="text-zinc-500">Local Y</span><span>{formatSmallNumber(livePositionForStatus.local_y_ned_m, 2, " m")}</span></div>
+            <div className="flex justify-between gap-3"><span className="text-zinc-500">Local Z</span><span>{formatSmallNumber(livePositionForStatus.local_z_ned_m, 2, " m")}</span></div>
           </div>
         </section>
 
@@ -2276,11 +3356,19 @@ function DroneStatusPanel({
             <div className="rounded-2xl bg-zinc-950/55 p-2"><p className="text-zinc-500">Ready</p><strong>{status.mission_runtime?.mission_ready ? "YES" : "NO"}</strong></div>
             <div className="rounded-2xl bg-zinc-950/55 p-2"><p className="text-zinc-500">Start</p><strong>{status.mission_runtime?.mission_start_in_progress ? "PENDING" : "IDLE"}</strong></div>
             <div className="rounded-2xl bg-zinc-950/55 p-2"><p className="text-zinc-500">Step</p><strong>{status.mission_runtime?.current_item_index ?? "--"}</strong></div>
-            <div className="rounded-2xl bg-zinc-950/55 p-2"><p className="text-zinc-500">Alt Offset</p><strong>{formatSmallNumber(status.mission_runtime?.altitude_offset_m, 2, " m")}</strong></div>
+            <div className="rounded-2xl bg-zinc-950/55 p-2"><p className="text-zinc-500">Item</p><strong>{status.mission_runtime?.current_item_type ?? "--"}</strong></div>
+            <div className="rounded-2xl bg-zinc-950/55 p-2"><p className="text-zinc-500">Armed</p><strong>{status.mission_runtime?.vehicle?.armed ? "YES" : "NO"}</strong></div>
+            <div className="rounded-2xl bg-zinc-950/55 p-2"><p className="text-zinc-500">Landed</p><strong>{status.mission_runtime?.vehicle?.landed ? "YES" : "NO"}</strong></div>
           </div>
           <div className="mt-3 rounded-2xl border border-white/10 bg-zinc-950/55 px-3 py-3 text-xs">
-            <p className="text-zinc-500">BT branch</p>
-            <p className="mt-1 font-semibold text-zinc-100">{status.mission_runtime?.active_bt_branch ?? "--"}</p>
+            <p className="text-zinc-500">Local NED</p>
+            <p className="mt-1 font-semibold text-zinc-100">
+              X {formatSmallNumber(status.mission_runtime?.vehicle?.x_ned_m, 2, " m")} · Y {formatSmallNumber(status.mission_runtime?.vehicle?.y_ned_m, 2, " m")} · Z {formatSmallNumber(status.mission_runtime?.vehicle?.z_ned_m, 2, " m")}
+            </p>
+            <p className="mt-2 text-zinc-500">Local Reference</p>
+            <p className="mt-1 font-semibold text-zinc-100">
+              {status.mission_runtime?.vehicle?.local_reference_valid ? "VALID" : "INVALID"} · Lat {formatCoordinate(status.mission_runtime?.vehicle?.ref_lat_deg)} · Lon {formatCoordinate(status.mission_runtime?.vehicle?.ref_lon_deg)} · AMSL {formatSmallNumber(status.mission_runtime?.vehicle?.ref_alt_msl_m, 2, " m")}
+            </p>
             {status.mission_runtime?.last_error ? <p className="mt-2 text-rose-200">{status.mission_runtime.last_error}</p> : null}
           </div>
         </section>
@@ -2352,6 +3440,21 @@ export default function App() {
   const [selectedDroneId, setSelectedDroneId] = useState("1:1");
   const [activeMapPickIndex, setActiveMapPickIndex] = useState(null);
   const [flightTrack, setFlightTrack] = useState([]);
+  const [pauseWorkflowLocalActive, setPauseWorkflowLocalActive] = useState(() => {
+    try {
+      return window.localStorage.getItem("missionUiPauseWorkflowLocalActive") === "true";
+    } catch {
+      return false;
+    }
+  });
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem("missionUiPauseWorkflowLocalActive", pauseWorkflowLocalActive ? "true" : "false");
+    } catch {
+      // localStorage may be unavailable in private/browser-restricted mode.
+    }
+  }, [pauseWorkflowLocalActive]);
 
   useEffect(() => {
     let active = true;
@@ -2514,29 +3617,36 @@ export default function App() {
   }
 
   function updateWaypointFromMap(index, latitude, longitude, options = {}) {
-    if (!hasValidCoordinate(latitude, longitude)) {
-      return;
-    }
-
     const hasAltitudeUpdate = Number.isFinite(Number(options.altitude_m));
     const nextAltitude = hasAltitudeUpdate ? Number(Number(options.altitude_m).toFixed(2)) : null;
 
     setMissionItems((previous) =>
-      previous.map((item, itemIndex) =>
-        itemIndex === index
-          ? {
-              ...item,
-              latitude_deg: Number(latitude),
-              longitude_deg: Number(longitude),
-              ...(hasAltitudeUpdate ? { altitude_m: nextAltitude } : {}),
-            }
-          : item,
-      ),
+      previous.map((item, itemIndex) => {
+        if (itemIndex !== index) {
+          return item;
+        }
+
+        const shouldUpdateCoordinate = itemCanUseMapCoordinate(item) && !options.onlyAltitude;
+        if (shouldUpdateCoordinate && !hasValidCoordinate(latitude, longitude)) {
+          return item;
+        }
+
+        return {
+          ...item,
+          ...(shouldUpdateCoordinate
+            ? { latitude_deg: Number(latitude), longitude_deg: Number(longitude) }
+            : {}),
+          ...(hasAltitudeUpdate ? { altitude_m: nextAltitude } : {}),
+        };
+      }),
     );
 
     if (!options.silent) {
+      const coordinateText = !options.onlyAltitude && hasValidCoordinate(latitude, longitude)
+        ? `${Number(latitude).toFixed(7)}, ${Number(longitude).toFixed(7)}`
+        : "altitude only";
       const altitudeText = hasAltitudeUpdate ? `, alt ${nextAltitude.toFixed(2)} m` : "";
-      pushLog("success", "Mission item updated", `Step ${index + 1}: ${Number(latitude).toFixed(7)}, ${Number(longitude).toFixed(7)}${altitudeText}`);
+      pushLog("success", "Mission item updated", `Step ${index + 1}: ${coordinateText}${altitudeText}`);
     }
   }
 
@@ -2654,6 +3764,20 @@ export default function App() {
   const mapStatus = useMemo(() => ({
     vehicle: {
       position: status?.vehicle?.position ?? {},
+      runtime_vehicle: status?.mission_runtime?.vehicle ?? {},
+      last_local_position_age_s: status?.vehicle?.last_local_position_age_s ?? null,
+    },
+    state: status?.state ?? null,
+    active: status?.active ?? null,
+    altitude: status?.altitude ?? {},
+    mission_runtime: {
+      vehicle: status?.mission_runtime?.vehicle ?? {},
+      runtime_state: status?.mission_runtime?.runtime_state ?? status?.state ?? null,
+      mission_active: status?.mission_runtime?.mission_active ?? status?.active ?? null,
+      active: status?.mission_runtime?.active ?? status?.active ?? null,
+      altitude_offset_m: status?.mission_runtime?.altitude_offset_m ?? status?.altitude?.offset_m ?? null,
+      manual_altitude_active: status?.mission_runtime?.manual_altitude_active ?? status?.altitude?.offset_active ?? null,
+      target: status?.mission_runtime?.target ?? {},
     },
     mavlink: {
       connected: Boolean(status?.mavlink?.connected),
@@ -2661,22 +3785,73 @@ export default function App() {
       longitude_deg: status?.mavlink?.longitude_deg ?? null,
       altitude_amsl_m: status?.mavlink?.altitude_amsl_m ?? null,
       relative_altitude_m: status?.mavlink?.relative_altitude_m ?? null,
+      global_origin_lat_deg: status?.mavlink?.global_origin_lat_deg ?? null,
+      global_origin_lon_deg: status?.mavlink?.global_origin_lon_deg ?? null,
+      global_origin_alt_msl_m: status?.mavlink?.global_origin_alt_msl_m ?? null,
+      local_x_ned_m: status?.mavlink?.local_x_ned_m ?? null,
+      local_y_ned_m: status?.mavlink?.local_y_ned_m ?? null,
+      local_z_ned_m: status?.mavlink?.local_z_ned_m ?? null,
       heading_deg: status?.mavlink?.heading_deg ?? null,
       yaw_deg: status?.mavlink?.yaw_deg ?? null,
     },
   }), [
-    status?.vehicle?.position?.latitude_deg,
-    status?.vehicle?.position?.longitude_deg,
-    status?.vehicle?.position?.altitude_amsl_m,
+    status?.vehicle?.position,
+    status?.state,
+    status?.active,
+    status?.altitude,
+    status?.mission_runtime?.vehicle,
+    status?.mission_runtime?.runtime_state,
+    status?.mission_runtime?.mission_active,
+    status?.mission_runtime?.active,
+    status?.mission_runtime?.altitude_offset_m,
+    status?.mission_runtime?.manual_altitude_active,
+    status?.mission_runtime?.target,
+    status?.vehicle?.last_local_position_age_s,
     status?.mavlink?.connected,
     status?.mavlink?.latitude_deg,
     status?.mavlink?.longitude_deg,
     status?.mavlink?.altitude_amsl_m,
     status?.mavlink?.relative_altitude_m,
+    status?.mavlink?.global_origin_lat_deg,
+    status?.mavlink?.global_origin_lon_deg,
+    status?.mavlink?.global_origin_alt_msl_m,
+    status?.mavlink?.local_x_ned_m,
+    status?.mavlink?.local_y_ned_m,
+    status?.mavlink?.local_z_ned_m,
     status?.mavlink?.heading_deg,
     status?.mavlink?.yaw_deg,
   ]);
+  const missionPause = status?.mission_runtime?.pause ?? {};
+  const missionPausePhase = String(missionPause?.phase ?? "").toLowerCase();
+  const missionRuntimeState = String(
+    status?.mission_runtime?.runtime_state ??
+    status?.mission_runtime?.state ??
+    status?.state ??
+    "",
+  ).toLowerCase();
+  const pauseWorkflowStates = [
+    "pause_rtl",
+    "rtl_landing",
+    "landed_wait_continue",
+    "resume_arm",
+    "return_pause_point",
+  ];
+  const pauseWorkflowFromRuntime = Boolean(
+    missionPause?.paused ||
+    missionPause?.has_pause_point ||
+    pauseWorkflowStates.includes(missionPausePhase) ||
+    pauseWorkflowStates.includes(missionRuntimeState),
+  );
+  const isPausedWorkflow = Boolean(pauseWorkflowFromRuntime || pauseWorkflowLocalActive);
+  const pauseControl = {
+    phase: missionPausePhase || missionRuntimeState || null,
+    isPausedWorkflow,
+    source: pauseWorkflowFromRuntime ? "runtime" : (pauseWorkflowLocalActive ? "local" : "idle"),
+  };
   const waypointCount = missionItems.filter((item) => item.type === "waypoint").length;
+  const currentMissionItemIndex = getCurrentMissionItemIndex(status);
+  const activeMissionDisplayIndex = getActiveMissionDisplayIndex(missionItems, currentMissionItemIndex);
+  const currentMissionActionLabel = getCurrentMissionActionLabel(status, missionItems, currentMissionItemIndex);
   const compactInputClass = "w-full rounded-2xl border border-white/10 bg-zinc-950/75 px-3 py-2 text-sm text-zinc-100 outline-none transition focus:border-cyan-400/70";
   const droneOptions = useMemo(() => getDroneOptions(status), [status]);
 
@@ -2721,8 +3896,25 @@ export default function App() {
           onClearMapPick={() => setActiveMapPickIndex(null)}
           onClearMissionItems={clearMissionItems}
           onSave={() => runAction("save", () => request("/api/mission", { method: "POST", body: JSON.stringify(payload) }), "Mission saved")}
-          onActivate={() => runAction("activate", () => request("/api/activate", { method: "POST", body: JSON.stringify({ activate: true }) }), "Activate sent")}
-          onRun={() => runAction("run", () => request("/api/mission/run", { method: "POST", body: JSON.stringify(payload) }), "Save + run sent")}
+          onRun={() => runAction("run", async () => {
+            setPauseWorkflowLocalActive(false);
+            return request("/api/mission/run", { method: "POST", body: JSON.stringify(payload) });
+          }, "Mission uploaded and activated")}
+          onPauseContinue={() => (pauseControl.isPausedWorkflow
+            ? runAction("continue", async () => {
+                const response = await request("/api/mission/continue", { method: "POST" });
+                setPauseWorkflowLocalActive(false);
+                return response;
+              }, "Continue mission sent")
+            : runAction("pause-rtl", async () => {
+                const response = await request("/api/mission/pause-rtl", { method: "POST" });
+                setPauseWorkflowLocalActive(true);
+                return response;
+              }, "Pause RTL sent"))}
+          onAbort={() => runAction("abort", async () => {
+            setPauseWorkflowLocalActive(false);
+            return request("/api/mission/abort", { method: "POST" });
+          }, "Mission stop sent")}
           onAppendItem={appendMissionItem}
           onAppendWaypointFromMap={appendWaypointFromMap}
           onUpdateMissionItem={updateMissionItem}
@@ -2734,6 +3926,10 @@ export default function App() {
           onItemDrop={handleItemDrop}
           onItemDragEnd={handleItemDragEnd}
           missionRuntime={status.mission_runtime ?? EMPTY_STATUS.mission_runtime}
+          pauseControl={pauseControl}
+          currentMissionItemIndex={currentMissionItemIndex}
+          activeMissionDisplayIndex={activeMissionDisplayIndex}
+          currentMissionActionLabel={currentMissionActionLabel}
         />
 
         <DroneStatusPanel

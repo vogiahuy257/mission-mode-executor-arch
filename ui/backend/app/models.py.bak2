@@ -171,16 +171,9 @@ class PayloadServoSnapshot(BaseModel):
 
 class MissionRuntimeVehicleSnapshot(BaseModel):
     valid: bool | None = None
-    global_position_valid: bool | None = None
     armed: bool | None = None
     landed: bool | None = None
     nav_state: int | None = None
-    arming_state: int | None = None
-    executor_in_charge: int | None = None
-    failsafe: bool | None = None
-    lat: float | None = None
-    lon: float | None = None
-    alt_msl: float | None = None
     x_ned_m: float | None = None
     y_ned_m: float | None = None
     z_ned_m: float | None = None
@@ -193,30 +186,19 @@ class MissionRuntimeVehicleSnapshot(BaseModel):
 class MissionRuntimeSnapshot(BaseModel):
     available: bool = False
     runtime_state: str | None = None
-    mission_loaded: bool | None = None
     mission_ready: bool | None = None
     mission_active: bool | None = None
     mission_start_in_progress: bool | None = None
     current_item_index: int | None = None
     current_item_type: str | None = None
-    current_item_id: str | None = None
-    current_item: dict[str, Any] | None = None
-    mission_items: list[dict[str, Any]] = Field(default_factory=list)
-    mission_item_count: int | None = None
     vehicle: MissionRuntimeVehicleSnapshot = Field(default_factory=MissionRuntimeVehicleSnapshot)
     manual_altitude_active: bool | None = None
     altitude_offset_m: float | None = None
-    altitude_offset_active: bool | None = None
-    altitude_offset_rate_m_s: float | None = None
-    base_altitude_msl: float | None = None
-    actual_target_altitude_msl: float | None = None
-    altitude: dict[str, Any] | None = None
     throttle_input: float | None = None
     climb_rate_command_m_s: float | None = None
     target: TargetSnapshot = Field(default_factory=TargetSnapshot)
     payload_servo: PayloadServoSnapshot = Field(default_factory=PayloadServoSnapshot)
     pause: PauseSnapshot = Field(default_factory=PauseSnapshot)
-    raw_state: dict[str, Any] | None = None
     last_error: str | None = None
     last_update_age_s: float | None = None
 
@@ -295,7 +277,6 @@ class StatusSnapshot(BaseModel):
     pickup_topic: str
     pause_rtl_topic: str
     continue_mission_topic: str
-    mission_state_topic: str
     # Deprecated compatibility fields for old frontend panels.
     start_topic: str
     return_home_topic: str

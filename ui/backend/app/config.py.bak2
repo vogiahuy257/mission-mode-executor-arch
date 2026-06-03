@@ -6,9 +6,10 @@ from dataclasses import dataclass
 
 DEFAULT_API_TITLE = "Adaptive Mission UI API"
 
-# ROS API of adaptive_mission_mode:
+# ROS API of adaptive_mission_mode_simple:
 #   /adaptive_mission_mode/mission_json : std_msgs/msg/String
 #   /adaptive_mission_mode/activate     : std_msgs/msg/Bool
+#   /adaptive_mission_mode/pickup       : std_msgs/msg/String
 #   /adaptive_mission_mode/pause_rtl    : std_msgs/msg/Bool
 #   /adaptive_mission_mode/continue_mission : std_msgs/msg/Bool
 DEFAULT_MISSION_TOPIC = "/adaptive_mission_mode/mission_json"
@@ -22,8 +23,9 @@ DEFAULT_CONTINUE_MISSION_TOPIC = "/adaptive_mission_mode/continue_mission"
 DEFAULT_START_TOPIC = DEFAULT_ACTIVATE_TOPIC
 DEFAULT_RETURN_HOME_TOPIC = DEFAULT_ACTIVATE_TOPIC
 
-# New adaptive_mission_mode publishes one consolidated UI state topic.
-DEFAULT_MISSION_STATUS_TOPIC = "/adaptive_mission_mode/state"
+# The simple ROS mode does not publish a runtime status topic. Keep this optional
+# so an older richer mode can still be monitored by setting the environment var.
+DEFAULT_MISSION_STATUS_TOPIC = ""
 DEFAULT_STATUS_TIMEOUT_S = 3.0
 DEFAULT_START_DELAY_S = 0.25
 DEFAULT_VEHICLE_STATUS_TOPIC = "/fmu/out/vehicle_status"

@@ -114,7 +114,6 @@ async def health() -> dict[str, object]:
         "pickup_topic": snapshot.pickup_topic,
         "pause_rtl_topic": snapshot.pause_rtl_topic,
         "continue_mission_topic": snapshot.continue_mission_topic,
-        "mission_state_topic": snapshot.mission_state_topic,
     }
 
 
