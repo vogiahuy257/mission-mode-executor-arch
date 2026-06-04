@@ -98,7 +98,7 @@ AdaptiveMissionNode::AdaptiveMissionNode(std::shared_ptr<rclcpp::Node> node)
  * Logic:
  * - Mission chỉ được cache từ mission_topic/fc_mission_topic.
  * - Mission chỉ được parse/load khi user chọn Adaptive Mode hoặc activate topic được bật.
- * - Các tham số snapshot_return_* dùng cho pha quay về snapshot sau khi user đổi mode giữa mission.
+ * - Các tham số snapshot_return_* giữ lại cho luồng legacy/fallback, resume chính dùng waypoint chèn.
  */
 void AdaptiveMissionNode::loadParameters()
 {
@@ -134,7 +134,7 @@ void AdaptiveMissionNode::loadParameters()
  * Logic:
  * - AdaptiveMissionExecutor chạy mission px4_ros2.
  * - Mission executor nhận callback missionControlBlocked() để dừng setpoint mission trong PRE_TAKEOFF/RETURN_TO_SNAPSHOT.
- * - snapshotGotoSetpoint_ chỉ dùng để bay về snapshot, không tạo mission mới.
+ * - snapshotGotoSetpoint_ chỉ giữ cho luồng legacy/fallback; resume chính tạo mission mới có waypoint chèn.
  */
 void AdaptiveMissionNode::createRuntimeObjects()
 {
@@ -371,9 +371,15 @@ void AdaptiveMissionNode::processRuntimeEvents()
 
   if (modeDeactivatedEvent_) {
     modeDeactivatedEvent_ = false;
+    adaptiveFallingEdge_ = false;
 
     if (state_ == RuntimeState::Running || state_ == RuntimeState::ReturnToSnapshot) {
-      if (missionSnapshot_.valid && missionLoaded_ && runtimeMissionLoaded_ && !missionFinished_) {
+      if (missionLoaded_ && runtimeMissionLoaded_ && !missionFinished_) {
+        if (!prepareResumeMissionFromInterruptPoint()) {
+          enterState(RuntimeState::Error, "Cannot prepare resume mission from interrupt point");
+          return;
+        }
+
         enterState(RuntimeState::ExternalInterruptedWaitSelection, "Adaptive Mode deactivated during mission");
       }
     }
@@ -388,8 +394,12 @@ void AdaptiveMissionNode::processRuntimeEvents()
     }
 
     if (state_ == RuntimeState::WaitAdaptiveActivationForResume) {
-      enterReturnToSnapshot("Adaptive Mode activated for resume");
+      enterState(RuntimeState::Running, "Adaptive Mode activated, resume mission starts from inserted interrupt waypoint");
       return;
+    }
+
+    if (state_ == RuntimeState::ExternalInterruptedWaitSelection) {
+      adaptiveRisingEdge_ = true;
     }
 
     if (state_ == RuntimeState::NoMissionStandby) {
@@ -413,18 +423,23 @@ void AdaptiveMissionNode::processRuntimeEvents()
     externalLandingParked_ = false;
 
     if (!missionSnapshot_.valid) {
-      enterState(RuntimeState::Error, "Cannot resume: no mission snapshot");
+      enterState(RuntimeState::Error, "Cannot resume: no inserted interrupt waypoint");
       return;
     }
 
-    const double snapshotAltitudeMsl = missionSnapshot_.position.z();
+    const double resumeTakeoffAltitudeMsl = missionSnapshot_.position.z();
 
-    if (autoTakeoff_ && needPreTakeoff(snapshotAltitudeMsl)) {
-      enterPreTakeoff("Adaptive selected again after external interruption", snapshotAltitudeMsl);
+    if (!missionReady_) {
+      enterState(RuntimeState::LoadingMission, "Waiting inserted resume mission readiness");
+      return;
+    }
+
+    if (autoTakeoff_ && needPreTakeoff(resumeTakeoffAltitudeMsl)) {
+      enterPreTakeoff("Adaptive selected again after external interruption", resumeTakeoffAltitudeMsl);
     } else if (adaptiveModeActive_ || adaptiveModeSelected()) {
-      enterReturnToSnapshot("Adaptive selected again and mode already active");
+      enterState(RuntimeState::Running, "Adaptive selected again, resume mission starts from inserted interrupt waypoint");
     } else {
-      enterState(RuntimeState::WaitAdaptiveActivationForResume, "Waiting Adaptive activation before return to snapshot");
+      enterState(RuntimeState::WaitAdaptiveActivationForResume, "Waiting Adaptive activation for inserted resume mission");
       sendAdaptiveModeThrottled();
     }
 
@@ -475,7 +490,15 @@ void AdaptiveMissionNode::updateRuntimeState()
 
     case RuntimeState::LoadingMission:
       if (missionLoaded_ && missionReady_) {
-        const double takeoffAltitudeMsl = targetTakeoffAltitudeMsl();
+        double takeoffAltitudeMsl = targetTakeoffAltitudeMsl();
+
+        if (plan_.json.contains("resume_from_interrupt") &&
+          plan_.json.at("resume_from_interrupt").is_object() &&
+          plan_.json.at("resume_from_interrupt").contains("alt_msl") &&
+          plan_.json.at("resume_from_interrupt").at("alt_msl").is_number())
+        {
+          takeoffAltitudeMsl = plan_.json.at("resume_from_interrupt").at("alt_msl").get<double>();
+        }
 
         if (autoTakeoff_ && ((autoArm_ && !armed_) || needPreTakeoff(takeoffAltitudeMsl))) {
           enterPreTakeoff("Mission ready", std::nullopt);
@@ -543,7 +566,7 @@ void AdaptiveMissionNode::enterState(RuntimeState nextState, const char * reason
 /**
  * @brief Bắt đầu auto ARM/TAKEOFF.
  *
- * Nếu overrideAltitudeMsl có giá trị, đây là resume về snapshot.
+ * Nếu overrideAltitudeMsl có giá trị, đây là resume/takeoff tới độ cao cần khôi phục.
  * Nếu không có, dùng altitude takeoff của mission.
  */
 void AdaptiveMissionNode::enterPreTakeoff(
@@ -572,6 +595,151 @@ void AdaptiveMissionNode::enterReturnToSnapshot(const char * reason)
 
   resetCommandTimers();
   enterState(RuntimeState::ReturnToSnapshot, reason);
+}
+
+
+/**
+ * @brief Lấy vị trí global hiện tại của UAV theo MSL.
+ */
+std::optional<Eigen::Vector3d> AdaptiveMissionNode::currentGlobalPositionMsl() const
+{
+  if (globalPosition_ && globalPosition_->positionValid()) {
+    return globalPosition_->position();
+  }
+
+  return std::nullopt;
+}
+
+/**
+ * @brief Tạo mission resume bằng cách chèn waypoint tại điểm bị ngắt.
+ *
+ * Logic:
+ * - Gọi ngay khi phát hiện nav_state rời Adaptive trong lúc mission đang chạy.
+ * - Lấy tọa độ UAV hiện tại tại thời điểm bị ngắt.
+ * - Tạo mission runtime mới: [điểm_bị_ngắt] + [item đang làm dở] + [các item còn lại].
+ * - Không đụng cache mission gốc, chỉ thay mission runtime của executor.
+ *
+ * Output:
+ * - true nếu đã setMission thành công.
+ * - false nếu thiếu global position hoặc mission hiện tại không hợp lệ.
+ */
+bool AdaptiveMissionNode::prepareResumeMissionFromInterruptPoint()
+{
+  const auto interruptPosition = currentGlobalPositionMsl();
+
+  if (!interruptPosition && !missionSnapshot_.valid) {
+    RCLCPP_ERROR(
+      node_->get_logger(),
+      "Cannot prepare resume mission: no valid global position and no last mission snapshot");
+    return false;
+  }
+
+  const Eigen::Vector3d resumePosition = interruptPosition.value_or(missionSnapshot_.position);
+
+  if (!plan_.json.contains("mission") ||
+    !plan_.json.at("mission").is_object() ||
+    !plan_.json.at("mission").contains("items") ||
+    !plan_.json.at("mission").at("items").is_array())
+  {
+    RCLCPP_ERROR(node_->get_logger(), "Cannot prepare resume mission: invalid mission JSON");
+    return false;
+  }
+
+  const auto & oldItems = plan_.json.at("mission").at("items");
+
+  if (oldItems.empty()) {
+    RCLCPP_ERROR(node_->get_logger(), "Cannot prepare resume mission: empty mission items");
+    return false;
+  }
+
+  const int originalIndex = currentMissionIndex_ < 0 ? 0 : currentMissionIndex_;
+  int startIndex = originalIndex;
+
+  if (startIndex < 0) {
+    startIndex = 0;
+  }
+
+  if (startIndex >= static_cast<int>(oldItems.size())) {
+    startIndex = static_cast<int>(oldItems.size()) - 1;
+  }
+
+  const float resumeAltitudeOffsetM = altitudeOffset_.offsetM();
+  const double resumeWaypointAltitudeMsl =
+    resumePosition.z() - static_cast<double>(resumeAltitudeOffsetM);
+
+  nlohmann::json resumeWaypoint = {
+    {"type", "navigation"},
+    {"navigationType", "waypoint"},
+    {"frame", "global"},
+    {"id", std::string("resume_interrupt_point_") + std::to_string(node_->now().nanoseconds())},
+    {"x", resumePosition.x()},
+    {"y", resumePosition.y()},
+    {"z", resumeWaypointAltitudeMsl},
+    {"resume_inserted", true},
+    {"resume_original_index", originalIndex},
+    {"resume_original_hash", plan_.hash}
+  };
+
+  nlohmann::json newItems = nlohmann::json::array();
+  newItems.push_back(resumeWaypoint);
+
+  for (int index = startIndex; index < static_cast<int>(oldItems.size()); ++index) {
+    newItems.push_back(oldItems.at(index));
+  }
+
+  nlohmann::json resumeJson = plan_.json;
+  resumeJson["mission"]["items"] = newItems;
+  resumeJson["source_format"] = "adaptive_resume_inserted_interrupt_waypoint";
+  resumeJson["source_item_count"] = newItems.size();
+  resumeJson["resume_from_interrupt"] = {
+    {"enabled", true},
+    {"original_hash", plan_.hash},
+    {"original_index", originalIndex},
+    {"resume_start_index", startIndex},
+    {"lat", resumePosition.x()},
+    {"lon", resumePosition.y()},
+    {"alt_msl", resumePosition.z()},
+    {"waypoint_z_msl_without_offset", resumeWaypointAltitudeMsl},
+    {"altitude_offset_m", resumeAltitudeOffsetM},
+    {"used_live_global_position", interruptPosition.has_value()}
+  };
+
+  try {
+    plan_ = parsePlan(resumeJson.dump(), resumePosition.z());
+    executor_->setMission(px4_ros2::Mission(plan_.json));
+
+    missionLoaded_ = true;
+    runtimeMissionLoaded_ = true;
+    missionReady_ = false;
+    missionFinished_ = false;
+    currentMissionIndex_ = -1;
+
+    missionSnapshot_.valid = true;
+    missionSnapshot_.position = resumePosition;
+    missionSnapshot_.missionIndex = originalIndex;
+    missionSnapshot_.altitudeOffsetM = resumeAltitudeOffsetM;
+    missionSnapshot_.missionHash = plan_.hash;
+
+    preTakeoffOverrideAltitudeMsl_.reset();
+
+    RCLCPP_WARN(
+      node_->get_logger(),
+      "Resume mission prepared: inserted interrupt waypoint lat=%.7f lon=%.7f alt=%.2f before old index=%d, new_exec_count=%d",
+      resumePosition.x(),
+      resumePosition.y(),
+      resumePosition.z(),
+      startIndex,
+      plan_.executableItemCount);
+
+    publishState();
+    return true;
+  } catch (const std::exception & error) {
+    RCLCPP_ERROR(
+      node_->get_logger(),
+      "Failed to prepare resume mission from interrupt point: %s",
+      error.what());
+    return false;
+  }
 }
 
 /**
@@ -861,13 +1029,15 @@ void AdaptiveMissionNode::handleVehicleStatus(const px4_msgs::msg::VehicleStatus
   armed_ = message.arming_state == px4_msgs::msg::VehicleStatus::ARMING_STATE_ARMED;
 
   const bool selectedNow = adaptiveModeSelected();
+  const bool risingEdge = selectedNow && !adaptiveSelectedLast_;
+  const bool fallingEdge = !selectedNow && adaptiveSelectedLast_;
 
   adaptiveSelectedNow_ = selectedNow;
-  adaptiveRisingEdge_ = selectedNow && !adaptiveSelectedLast_;
-  adaptiveFallingEdge_ = !selectedNow && adaptiveSelectedLast_;
+  adaptiveRisingEdge_ = adaptiveRisingEdge_ || risingEdge;
+  adaptiveFallingEdge_ = adaptiveFallingEdge_ || fallingEdge;
   adaptiveSelectedLast_ = selectedNow;
 
-  if (adaptiveFallingEdge_) {
+  if (fallingEdge) {
     modeDeactivatedEvent_ = true;
   }
 }
@@ -932,6 +1102,10 @@ void AdaptiveMissionNode::handleVehicleLandDetected(
 void AdaptiveMissionNode::updateMissionSnapshot()
 {
   if (state_ != RuntimeState::Running) {
+    return;
+  }
+
+  if (!adaptiveModeSelected()) {
     return;
   }
 
@@ -1039,7 +1213,7 @@ void AdaptiveMissionNode::updateWaitAdaptiveActivation()
 {
   if (adaptiveModeActive_ || adaptiveModeSelected()) {
     if (state_ == RuntimeState::WaitAdaptiveActivationForResume) {
-      enterReturnToSnapshot("Adaptive Mode active while waiting resume activation");
+      enterState(RuntimeState::Running, "Adaptive Mode active, resume mission starts from inserted interrupt waypoint");
     } else {
       enterState(RuntimeState::Running, "Adaptive Mode active while waiting mission activation");
     }
@@ -1095,8 +1269,7 @@ void AdaptiveMissionNode::updateExternalInterruptedWaitSelection()
   }
 
   if (!adaptiveModeSelected() &&
-    navState_ == px4_msgs::msg::VehicleStatus::NAVIGATION_STATE_POSCTL &&
-    userIntentNavState_ == px4_msgs::msg::VehicleStatus::NAVIGATION_STATE_POSCTL)
+    navState_ == px4_msgs::msg::VehicleStatus::NAVIGATION_STATE_POSCTL)
   {
     resumeRequiresFreshAdaptiveSelection_ = false;
     externalLandingPosctlSent_ = false;
@@ -1508,6 +1681,10 @@ nlohmann::json AdaptiveMissionNode::buildMissionSummaryJson() const
 
   if (plan_.json.contains("source_hash")) {
     mission["source_hash"] = plan_.json.at("source_hash");
+  }
+
+  if (plan_.json.contains("resume_from_interrupt")) {
+    mission["resume_from_interrupt"] = plan_.json.at("resume_from_interrupt");
   }
 
   if (plan_.json.contains("skipped_source_items")) {

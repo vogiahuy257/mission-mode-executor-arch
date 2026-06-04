@@ -111,6 +111,10 @@ private:
 
   void enterReturnToSnapshot(const char * reason);
 
+  bool prepareResumeMissionFromInterruptPoint();
+
+  std::optional<Eigen::Vector3d> currentGlobalPositionMsl() const;
+
   void handleMissionCompleted();
 
   void sendArmThrottled();

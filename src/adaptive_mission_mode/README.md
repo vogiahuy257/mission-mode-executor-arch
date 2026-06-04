@@ -27,16 +27,17 @@ user chọn Adaptive Mission Mode
 → RUNNING
 
 đang RUNNING mà user chọn mode khác / RTL / LAND
-→ lưu snapshot cuối cùng
-→ giữ mission cũ trong executor
+→ phát hiện nav_state rời Adaptive Mode
+→ chụp tọa độ UAV ngay tại điểm bị ngắt
+→ tạo resume mission mới: [resume_interrupt_point] + [item đang làm dở] + [các item còn lại]
+→ setMission lại vào executor
 → state = external_interrupted_wait_selection
 
 user chọn Adaptive lại
-→ nếu cần thì takeoff tới altitude snapshot
+→ nếu cần thì takeoff lại tới độ cao tại điểm bị ngắt
 → vào Adaptive Mode
-→ bay về snapshot
-→ tới snapshot thì unblock executor
-→ mission cũ chạy tiếp
+→ executor bay tới waypoint resume_interrupt_point trước
+→ sau đó tự bay tiếp item đang làm dở và các waypoint còn lại
 
 mission completed hoặc ~/reset
 → clear cache/runtime/snapshot
@@ -83,7 +84,7 @@ running
 external_interrupted_wait_selection
 resume_takeoff
 wait_adaptive_activation_for_resume
-return_to_snapshot
+return_to_snapshot   # legacy/fallback, không còn là luồng resume chính
 completed
 error
 ```
