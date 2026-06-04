@@ -1,42 +1,66 @@
-# fc_mission_reader - passive MAVLink mission observer
+# fc_mission_reader
 
-Node này chạy trên ROS 2 C++ và quan sát MAVLink Mission Protocol theo kiểu **passive sniffer**.
-Nó không gửi `MISSION_REQUEST_LIST`, không gửi `MISSION_REQUEST_INT`, không gửi `MISSION_ACK`, nên không chen vào transaction mission của QGC/backend với FC.
+ROS 2 C++ node đọc mission đang lưu trong FC bằng MAVLink Mission Protocol, convert sang JSON, publish lên topic ROS 2 và lưu file cache.
 
-## Mục tiêu
+Bản này đã đổi sang **event-sync + verified cache + continuous publish khi FC có mission**:
 
-- QGC/backend upload mission mới lên FC -> node nghe các gói `MISSION_COUNT` + `MISSION_ITEM_INT/ITEM` + `MISSION_ACK ACCEPTED` -> build JSON -> publish một lần.
-- QGC/backend xóa mission trên FC -> node nghe `MISSION_CLEAR_ALL` + `MISSION_ACK ACCEPTED` hoặc `MISSION_CURRENT.total=0` -> publish JSON rỗng một lần.
-- Nếu node thấy FC báo mission metadata đổi qua `MISSION_CURRENT.mission_id/total` nhưng không bắt được full transfer -> ghi/publish trạng thái `unknown_remote_mission` để tránh dùng lại mission cache cũ.
-- Không publish cache cũ liên tục.
-- Publish reset `/adaptive_mission_mode/reset` chỉ khi mission thật sự đổi/xóa/unknown, có chống spam bằng signature + min interval.
+- Node **không publish cache cũ trước khi xác nhận với FC**.
+- Sau khi đã sync thành công và FC có mission, node sẽ publish lại JSON mission hiện tại liên tục theo `poll_period_s`.
+- Khi khởi động, node luôn hỏi FC trước để xác nhận trạng thái mission hiện tại.
+- Khi FC nhận mission mới, node tự phát hiện qua `MISSION_CURRENT.mission_id`, `MISSION_CURRENT.total` hoặc `MISSION_ACK.opaque_id` rồi tải lại full mission một lần.
+- Nếu mission trên FC bị xóa hoặc FC báo không có mission (`MISSION_COUNT.count = 0`), node sẽ ghi/publish JSON mission rỗng để không giữ mission cũ.
+- Fallback mặc định bật: node gửi `MISSION_REQUEST_LIST` nhẹ mỗi `fallback_count_poll_s` giây để bắt trường hợp firmware không stream mission id, hoặc khi mission bị xóa mà `MISSION_CURRENT` không đủ thông tin.
 
-## Giới hạn của passive mode
+## Luồng hoạt động
 
-Passive observer chỉ biết full waypoint khi nó nhìn thấy full MAVLink transfer đi qua router.
-Nếu node khởi động sau khi FC đã có sẵn mission và không có ai upload/download lại, node chỉ biết metadata từ `MISSION_CURRENT`, không thể biết full waypoint nếu không chủ động hỏi FC.
-Trong trường hợp đó, node không replay cache cũ. Nếu metadata khác cache, node ghi trạng thái `unknown_remote_mission`.
-
-## Luồng MAVLink nên dùng
-
-Ví dụ mavlink-router đang nhận MAVLink ở port 14550 và QGC ở `10.5.10.25`:
-
-```bash
-mavlink-routerd \
-  -e 10.5.10.25:14550 \
-  -e 127.0.0.1:14551 \
-  0.0.0.0:14550
+```text
+Start node
+  ↓
+Load cache file nếu có, nhưng chưa publish ngay
+  ↓
+Request MISSION_COUNT từ FC để sync trạng thái thật
+  ↓
+Nếu count = 0:
+    publish/save JSON mission rỗng
+Nếu count > 0:
+    download full mission
+    build JSON
+    publish/save, sau đó publish lại liên tục theo poll_period_s
+  ↓
+Trong lúc chạy:
+    nghe MISSION_CURRENT / MISSION_ACK
+    nếu mission id, opaque id hoặc total đổi → sync lại
+    nếu không có event → fallback MISSION_COUNT mỗi 5s
 ```
 
-`127.0.0.1:14551` là endpoint nội bộ cho node nếu node chạy cùng máy với mavlink-routerd.
+## Output topic
+
+```bash
+/fc_mission_reader/mission_json
+```
+
+Topic dùng QoS `transient_local`. Với bản này:
+
+1. Startup chưa sync FC xong thì **không spam cache cũ**.
+2. Nếu FC có mission (`MISSION_COUNT.count > 0`) và JSON đã được tải thành công, node publish `/fc_mission_reader/mission_json` liên tục theo `poll_period_s`.
+3. Nếu mission trên FC đổi, node tải lại full mission, update JSON/cache, rồi tiếp tục publish JSON mới.
+4. Nếu mission trên FC bị xóa / `count = 0`, node publish/save JSON rỗng một lần để xóa trạng thái cũ, sau đó không spam mission cũ nữa.
+
+## Tham số quan trọng
+
+```text
+publish_cached_mission_continuously=true  # publish JSON mission liên tục nếu FC đang có mission
+poll_period_s=1.0                         # chu kỳ publish khi mission không đổi
+enable_fallback_count_poll=true           # vẫn kiểm tra MISSION_COUNT để bắt xóa mission
+fallback_count_poll_s=5.0                 # chu kỳ hỏi nhẹ MISSION_COUNT
+```
 
 ## Build
 
 ```bash
 cd ~/mission-mode-executor-arch/src
 rm -rf fc_mission_reader
-unzip /path/to/fc_mission_reader_passive_observer.zip
-mv fc_mission_reader_passive_observer fc_mission_reader
+unzip /path/to/fc_mission_reader_event_sync_v3.zip
 
 cd ~/mission-mode-executor-arch
 source /opt/ros/humble/setup.bash
@@ -44,91 +68,110 @@ colcon build --symlink-install --packages-select fc_mission_reader
 source install/setup.bash
 ```
 
+Nếu trước đó install còn file cache cũ, có thể xóa để test sạch:
+
+```bash
+rm -f ~/mission-mode-executor-arch/install/fc_mission_reader/share/fc_mission_reader/data.json
+rm -f ~/mission-mode-executor-arch/src/fc_mission_reader/data.json
+```
+
+Không bắt buộc xóa, vì node sẽ tự overwrite khi sync được FC.
+
 ## Run
+
+Ví dụ dùng `mavlink-router` forward MAVLink tới port 14551:
+
+```bash
+mavlink-routerd \
+  -e 127.0.0.1:14550 \
+  -e 127.0.0.1:14551 \
+  0.0.0.0:14550
+```
+
+Chạy node:
 
 ```bash
 ros2 launch fc_mission_reader fc_mission_reader.launch.py \
   bind_ip:=0.0.0.0 \
   bind_port:=14551 \
-  publish_reset_on_mission_change:=true \
-  adaptive_reset_topic:=/adaptive_mission_mode/reset
+  auto_target:=true \
+  poll_period_s:=1.0 \
+  publish_cached_mission_continuously:=true \
+  enable_fallback_count_poll:=true \
+  fallback_count_poll_s:=5.0
 ```
 
-## Topics
+Nếu `auto_target:=true`, node tự học peer MAVLink từ packet nhận được. Nếu muốn chỉ định cứng:
 
-### Publish
-
-- `~/mission_json` (`std_msgs/msg/String`)
-  - Thực tế: `/fc_mission_reader/mission_json`
-  - QoS: transient local, depth 1.
-  - Chỉ publish khi có event cần thiết, không publish timer spam.
-
-- `/adaptive_mission_mode/reset` (`std_msgs/msg/Bool`)
-  - Chỉ publish `true` một lần khi mission đổi/xóa/unknown và signature mới.
-
-## JSON status
-
-### Mission sẵn sàng
-
-```json
-{
-  "ok": true,
-  "source": "mavlink_passive_observer",
-  "status": "ready",
-  "item_count": 3,
-  "mission": {"version": 1, "mission": {"items": []}},
-  "raw_items": []
-}
+```bash
+ros2 launch fc_mission_reader fc_mission_reader.launch.py \
+  auto_target:=false \
+  target_ip:=127.0.0.1 \
+  target_port:=14550
 ```
 
-### Mission rỗng / đã xóa
-
-```json
-{
-  "ok": true,
-  "source": "mavlink_passive_observer",
-  "status": "empty",
-  "item_count": 0,
-  "mission": {"version": 1, "mission": {"items": []}},
-  "raw_items": []
-}
+```bash
+ros2 launch fc_mission_reader fc_mission_reader.launch.py \
+  auto_target:=true \
+  bind_port:=14550 \
+  publish_cached_mission_continuously:=true \
+  enable_fallback_count_poll:=true \
+  fallback_count_poll_s:=0.5
 ```
-
-### Mission không rõ full waypoint
-
-```json
-{
-  "ok": false,
-  "source": "mavlink_passive_observer",
-  "status": "unknown_remote_mission",
-  "item_count": 7,
-  "mission": {"version": 1, "mission": {"items": []}},
-  "raw_items": []
-}
-```
-
-Trạng thái `unknown_remote_mission` dùng để tránh replay mission cũ khi FC báo mission đã đổi nhưng node không nhìn thấy đầy đủ waypoint.
-
-## Parameters
-
-- `bind_ip`: mặc định `0.0.0.0`.
-- `bind_port`: mặc định `14551`.
-- `poll_period_s`: mặc định `0.02`.
-- `read_budget_ms`: mặc định `50`.
-- `transfer_timeout_s`: mặc định `8.0`.
-- `publish_reset_on_mission_change`: mặc định `true`.
-- `publish_reset_on_startup_change`: mặc định `false`.
-- `reset_publish_min_interval_s`: mặc định `1.0`.
-- `adaptive_reset_topic`: mặc định `/adaptive_mission_mode/reset`.
-- `publish_unknown_on_remote_change`: mặc định `true`.
-- `publish_empty_from_mission_current`: mặc định `true`.
-- `output_file`: nếu rỗng sẽ dùng `share/fc_mission_reader/data.json`.
 
 ## Kiểm tra
 
+Echo JSON:
+
 ```bash
 ros2 topic echo /fc_mission_reader/mission_json
-ros2 topic echo /adaptive_mission_mode/reset
 ```
 
-Khi QGC upload mission mới, node sẽ log `observed mission upload count`, sau đó `FC accepted observed mission upload`, rồi publish JSON một lần.
+Xem file cache:
+
+```bash
+cat ~/mission-mode-executor-arch/install/fc_mission_reader/share/fc_mission_reader/data.json | jq .
+```
+
+Nếu dùng `--symlink-install`, file có thể nằm ở source package:
+
+```bash
+cat ~/mission-mode-executor-arch/src/fc_mission_reader/data.json | jq .
+```
+
+## Test xóa mission trên FC
+
+Sau khi xóa mission bằng QGC hoặc backend, node sẽ nhận `MISSION_COUNT.count = 0` ở lần fallback poll kế tiếp và publish JSON dạng rỗng:
+
+```json
+{
+  "ok": true,
+  "item_count": 0,
+  "mission": {
+    "version": 1,
+    "mission": {
+      "items": []
+    }
+  },
+  "raw_items": []
+}
+```
+
+Nhờ vậy adaptive/backend sẽ không còn đọc nhầm mission cũ trong `data.json`.
+
+## Gợi ý dùng với adaptive_mission_mode
+
+Không nên để adaptive tự chạy ngay khi topic có message. Flow an toàn hơn:
+
+```text
+fc_mission_reader chỉ giữ JSON mission hiện tại của FC
+adaptive_mission_mode chỉ load JSON khi user chọn active mode
+mission hoàn thành → adaptive tự clear runtime mission của nó
+mission bị xóa trên FC → fc_mission_reader publish mission rỗng
+```
+
+## v4 note
+
+- Request MAVLink mission is sent to all valid known endpoints: configured target, learned/observed MAVLink peer.
+- If `target_port` equals `bind_port` on localhost, the node skips that self-loop target and uses the observed MAVLink peer instead.
+- This avoids the common case where the node can see `MISSION_CURRENT` but cannot receive `MISSION_COUNT` because the manual target port is the local listening port.

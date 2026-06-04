@@ -4,13 +4,14 @@
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <optional>
 #include <utility>
+#include <vector>
 
 #include <px4_ros2/mission/mission.hpp>
 #include <px4_ros2/utils/message_version.hpp>
 
 #include "adaptive_mission_mode/mission/MissionParser.hpp"
-#include "adaptive_mission_mode/mission/ResumeMissionBuilder.hpp"
 
 using namespace std::chrono_literals;
 
@@ -21,13 +22,13 @@ namespace
 constexpr char kDefaultMissionTopic[] = "~/mission_json";
 constexpr char kDefaultFcMissionTopic[] = "/fc_mission_reader/mission_json";
 
+constexpr double kEarthRadiusM = 6371000.0;
+constexpr double kPi = 3.14159265358979323846;
+
 bool hasValidNumber(double value)
 {
   return std::isfinite(value);
 }
-
-constexpr double kEarthRadiusM = 6371000.0;
-constexpr double kPi = 3.14159265358979323846;
 
 double toRadians(double degree)
 {
@@ -91,6 +92,14 @@ AdaptiveMissionNode::AdaptiveMissionNode(std::shared_ptr<rclcpp::Node> node)
     fcMissionTopic_.c_str());
 }
 
+/**
+ * @brief Đọc toàn bộ cấu hình ROS param của node.
+ *
+ * Logic:
+ * - Mission chỉ được cache từ mission_topic/fc_mission_topic.
+ * - Mission chỉ được parse/load khi user chọn Adaptive Mode hoặc activate topic được bật.
+ * - Các tham số snapshot_return_* dùng cho pha quay về snapshot sau khi user đổi mode giữa mission.
+ */
 void AdaptiveMissionNode::loadParameters()
 {
   missionTopic_ = node_->declare_parameter<std::string>("mission_topic", kDefaultMissionTopic);
@@ -110,6 +119,7 @@ void AdaptiveMissionNode::loadParameters()
     node_->declare_parameter<double>("snapshot_return_vertical_velocity", 2.0));
   snapshotReturnMaxHeadingRate_ = static_cast<float>(
     node_->declare_parameter<double>("snapshot_return_max_heading_rate", 60.0));
+
   statePublishPeriodS_ = node_->declare_parameter<double>("state_publish_period_s", 1.0);
 
   commandTarget_.targetSystem = node_->declare_parameter<int>("target_system", 1);
@@ -118,6 +128,14 @@ void AdaptiveMissionNode::loadParameters()
   commandTarget_.sourceComponent = node_->declare_parameter<int>("source_component", 1);
 }
 
+/**
+ * @brief Tạo các object runtime chính.
+ *
+ * Logic:
+ * - AdaptiveMissionExecutor chạy mission px4_ros2.
+ * - Mission executor nhận callback missionControlBlocked() để dừng setpoint mission trong PRE_TAKEOFF/RETURN_TO_SNAPSHOT.
+ * - snapshotGotoSetpoint_ chỉ dùng để bay về snapshot, không tạo mission mới.
+ */
 void AdaptiveMissionNode::createRuntimeObjects()
 {
   executor_ = std::make_unique<AdaptiveMissionExecutor>(
@@ -159,153 +177,15 @@ void AdaptiveMissionNode::createRuntimeObjects()
   executor_->onActivated(
     [this]()
     {
-      active_ = true;
-
-      /*
-       * Case resume sau khi user rời Adaptive Mode giữa chuyến bay.
-       *
-       * Đây là state machine rõ ràng, không để onActivated() tự quyết định
-       * lặp lại ARM/TAKEOFF. Khi đang resume, onActivated() chỉ có hai việc:
-       * - Nếu đã qua giai đoạn takeoff/wait activation: bắt đầu return_to_snapshot.
-       * - Nếu đã ở return_to_snapshot: giữ nguyên, không làm gì thêm.
-       */
-      if (externalInterrupted_ && missionLoaded_ && runtimeMissionLoaded_) {
-        if (resumeFlowState_ == ResumeFlowState::ResumeTakeoff ||
-          resumeFlowState_ == ResumeFlowState::WaitAdaptiveActivation ||
-          preTakeoffActive_)
-        {
-          preTakeoffActive_ = false;
-          preTakeoffSent_ = false;
-          preModeSent_ = false;
-          preTakeoffOverrideAltitudeMsl_.reset();
-
-          beginReturnToSnapshot("Adaptive mode activated after resume takeoff");
-          return;
-        }
-
-        if (resumeFlowState_ == ResumeFlowState::ReturnToSnapshot) {
-          runtimeState_ = "return_to_snapshot";
-          publishState();
-          return;
-        }
-
-        beginReturnToSnapshot("Adaptive mode activated again");
-        return;
-      }
-
-      altitudeOffset_.reset();
-      missionFinished_ = false;
-
-      if (!runtimeMissionLoaded_) {
-        loadCachedMissionForExecution("mode activated");
-      }
-
-      if (!missionLoaded_ || !missionReady_) {
-        /*
-         * User có thể chọn Adaptive Mission Mode khi chưa nạp mission.
-         * Đây không phải lỗi chết node.
-         *
-         * Không gửi POSCTL ở đây vì khi vừa thoát custom mode, px4_ros2 có thể
-         * không còn nhận request từ FMU và ném timeout. Thay vào đó node đứng
-         * chờ mission_json; khi mission được cache, handleVehicleStatus() sẽ
-         * load mission và tiếp tục nếu Adaptive vẫn đang được chọn.
-         */
-        active_ = false;
-        runtimeState_ = "wait_mission_cache";
-        noCachedMissionRejectActive_ = true;
-
-        RCLCPP_WARN(
-          node_->get_logger(),
-          "Adaptive mode is active but no runtime mission is ready. Waiting for mission_json instead of leaving the mode.");
-
-        publishState();
-        return;
-      }
-
-      if (autoTakeoff_ && needPreTakeoff()) {
-        beginPreTakeoff("mode activated on ground");
-        return;
-      }
-
-      preTakeoffActive_ = false;
-      preTakeoffOverrideAltitudeMsl_.reset();
-      runtimeState_ = "mission";
-
-      publishState();
+      adaptiveModeActive_ = true;
+      modeActivatedEvent_ = true;
     });
 
   executor_->onDeactivated(
     [this]()
     {
-      const bool resumeTakeoffInProgress =
-        resumeFlowState_ == ResumeFlowState::ResumeTakeoff ||
-        resumeFlowState_ == ResumeFlowState::WaitAdaptiveActivation;
-
-      const bool shouldKeepMissionForReturn =
-        missionLoaded_ &&
-        runtimeMissionLoaded_ &&
-        !missionFinished_ &&
-        !preTakeoffActive_ &&
-        !resumeTakeoffInProgress &&
-        !pauseResume_.running() &&
-        !resumePending_ &&
-        missionSnapshot_.valid;
-
-      active_ = false;
-
-      if (!resumeTakeoffInProgress) {
-        returnToSnapshotActive_ = false;
-      }
-
-      /*
-       * Không reset preTakeoffOverrideAltitudeMsl_ khi đang pre-takeoff để
-       * resume về snapshot. Nếu reset ở đây, target takeoff sẽ rơi về altitude
-       * takeoff ban đầu của mission, gây log nhảy giữa 50 m và 10 m.
-       */
-      if (!preTakeoffActive_ && !resumeTakeoffInProgress) {
-        preTakeoffOverrideAltitudeMsl_.reset();
-      }
-
-      /*
-       * Nếu Adaptive Mode bị rời giữa chuyến bay do user chọn mode khác,
-       * không xóa mission và không build resume mission. Chỉ đánh dấu bị
-       * gián đoạn. Khi user chọn lại Adaptive Mode, node sẽ bay về snapshot.
-       */
-      if (shouldKeepMissionForReturn) {
-        externalInterrupted_ = true;
-        externalInterruptionNeutralModeSent_ = false;
-        resumeFlowState_ = ResumeFlowState::InterruptedWaitSelection;
-        runtimeState_ = "external_interrupted_wait_mode";
-
-        RCLCPP_WARN(
-          node_->get_logger(),
-          "Adaptive mode interrupted. Snapshot kept at lat=%.7f lon=%.7f alt=%.2f index=%d. Select Adaptive Mode again to return and continue.",
-          missionSnapshot_.position.x(),
-          missionSnapshot_.position.y(),
-          missionSnapshot_.position.z(),
-          missionSnapshot_.missionIndex);
-
-        publishState();
-        return;
-      }
-
-      if (resumeTakeoffInProgress) {
-        runtimeState_ = resumeFlowStateName();
-        publishState();
-        return;
-      }
-
-      if (pauseResume_.running()) {
-        runtimeState_ = pauseResume_.stateName();
-      } else if (resumePending_) {
-        runtimeState_ = "pause_wait_continue";
-      } else if (!preTakeoffActive_ && !missionLoaded_) {
-        currentMissionIndex_ = -1;
-        runtimeState_ = "idle";
-        altitudeOffset_.reset();
-      }
-
-      publishState();
+      adaptiveModeActive_ = false;
+      modeDeactivatedEvent_ = true;
     });
 
   executor_->onProgressUpdate(
@@ -318,31 +198,18 @@ void AdaptiveMissionNode::createRuntimeObjects()
   executor_->onCompleted(
     [this]()
     {
-      missionFinished_ = true;
-      active_ = false;
-      preTakeoffActive_ = false;
-      returnToSnapshotActive_ = false;
-      externalInterrupted_ = false;
-      resumeFlowState_ = ResumeFlowState::None;
-      runtimeState_ = "done";
-
-      clearMissionMemory(true);
-      runtimeState_ = "done";
-
-      /*
-       * Mission hoàn thành thì mới xóa cache/runtime mission.
-       * Sau đó rời Adaptive Mission Mode để tránh vòng lặp auto arm/takeoff lại.
-       */
-      px4Command_->posctl();
-
-      RCLCPP_WARN(
-        node_->get_logger(),
-        "Mission completed. Cached mission/runtime state cleared and PX4 switched to POSCTL.");
-
-      publishState();
+      missionCompletedEvent_ = true;
     });
 }
 
+/**
+ * @brief Tạo publisher/subscriber ROS2.
+ *
+ * Logic:
+ * - Callback chỉ cập nhật dữ liệu hoặc đẩy event.
+ * - Không gửi ARM/TAKEOFF/SET_MODE trực tiếp trong callback.
+ * - Quyết định điều khiển được gom trong mainLoop()/RuntimeState.
+ */
 void AdaptiveMissionNode::createRosInterfaces()
 {
   statePublisher_ = node_->create_publisher<std_msgs::msg::String>(
@@ -434,6 +301,13 @@ void AdaptiveMissionNode::createRosInterfaces()
     });
 }
 
+/**
+ * @brief Tạo một main loop duy nhất.
+ *
+ * Logic:
+ * - Chỉ có mainLoop() được quyết định gửi command PX4.
+ * - Callback chỉ cập nhật dữ liệu/event.
+ */
 void AdaptiveMissionNode::createTimers()
 {
   mainLoopTimer_ = node_->create_wall_timer(
@@ -442,332 +316,282 @@ void AdaptiveMissionNode::createTimers()
 }
 
 /**
- * @brief Vòng lặp runtime chính của node.
+ * @brief Vòng lặp runtime chính.
  *
- * Logic:
- * - Thử đăng ký Adaptive Mission Mode khi FMU DDS đã sẵn sàng.
- * - Cập nhật offset độ cao theo cần ga.
- * - Lưu snapshot liên tục khi mission đang chạy.
- * - Nếu đang return_to_snapshot thì gửi setpoint bay về snapshot.
- * - Retry mission nếu trước đó thiếu altitude reference.
- * - Xử lý state machine auto ARM/TAKEOFF.
- * - Xử lý state machine pause/continue cũ nếu còn dùng.
- * - Publish state định kỳ cho backend/UI.
+ * Thứ tự xử lý cố định:
+ * 1. Register custom mode nếu FMU sẵn sàng.
+ * 2. Cập nhật altitude offset.
+ * 3. Lưu snapshot khi đang RUNNING.
+ * 4. Xử lý event từ callback.
+ * 5. Cập nhật state machine và gửi command nếu cần.
+ * 6. Publish state có throttle.
  */
 void AdaptiveMissionNode::mainLoop()
 {
   registerModeIfNeeded();
   updateAltitudeOffset();
   updateMissionSnapshot();
-  updateReturnToSnapshot();
-  settleExternalInterruptionIfNeeded();
-  retryPendingMissionIfReady();
-  updatePreTakeoff();
-  updatePauseResume();
+  processRuntimeEvents();
+  updateRuntimeState();
   publishStateThrottled();
 }
 
 /**
- * @brief Publish state với throttle để main loop 50 ms không spam topic state.
+ * @brief Xử lý các event đã được callback ghi lại.
  */
-void AdaptiveMissionNode::publishStateThrottled()
+void AdaptiveMissionNode::processRuntimeEvents()
 {
-  const auto now = node_->now();
+  if (missionCompletedEvent_) {
+    missionCompletedEvent_ = false;
+    handleMissionCompleted();
+    return;
+  }
 
-  if (lastStatePublish_.nanoseconds() != 0 &&
-    (now - lastStatePublish_).seconds() < statePublishPeriodS_)
+  if (resumeRequiresFreshAdaptiveSelection_ &&
+    (modeActivatedEvent_ || adaptiveRisingEdge_ || adaptiveModeSelected() || adaptiveModeActive_))
   {
-    return;
-  }
+    modeActivatedEvent_ = false;
+    adaptiveRisingEdge_ = false;
 
-  lastStatePublish_ = now;
-  publishState();
-}
-
-/**
- * @brief Lưu snapshot vị trí mission đang bay.
- *
- * Logic:
- * - Chỉ lưu khi mission cũ đang active và không bị block bởi pre-takeoff/return.
- * - Snapshot gồm lat/lon/alt, current mission index, altitude offset và hash mission.
- * - Nếu user bất ngờ chọn mode khác, snapshot này sẽ là điểm để quay lại.
- */
-void AdaptiveMissionNode::updateMissionSnapshot()
-{
-  if (!active_ || !missionLoaded_ || !runtimeMissionLoaded_) {
-    return;
-  }
-
-  if (preTakeoffActive_ || returnToSnapshotActive_) {
-    return;
-  }
-
-  if (!globalPosition_ || !globalPosition_->positionValid()) {
-    return;
-  }
-
-  missionSnapshot_.valid = true;
-  missionSnapshot_.position = globalPosition_->position();
-  missionSnapshot_.missionIndex = currentMissionIndex_;
-  missionSnapshot_.altitudeOffsetM = altitudeOffset_.offsetM();
-  missionSnapshot_.missionHash = plan_.hash;
-
-  const auto now = node_->now();
-
-  if (lastSnapshotLog_.nanoseconds() == 0 ||
-    (now - lastSnapshotLog_).seconds() > 5.0)
-  {
-    lastSnapshotLog_ = now;
-
-    RCLCPP_INFO(
-      node_->get_logger(),
-      "Mission snapshot lat=%.7f lon=%.7f alt=%.2f index=%d offset=%.2f",
-      missionSnapshot_.position.x(),
-      missionSnapshot_.position.y(),
-      missionSnapshot_.position.z(),
-      missionSnapshot_.missionIndex,
-      missionSnapshot_.altitudeOffsetM);
-  }
-}
-
-/**
- * @brief Bắt đầu bay về snapshot sau khi user chọn lại Adaptive Mission Mode.
- *
- * Logic:
- * - Không parse lại mission.
- * - Không setMission lại.
- * - Không build resume mission.
- * - Chỉ bật returnToSnapshotActive_ để block executor mission cũ.
- */
-void AdaptiveMissionNode::beginReturnToSnapshot(const char * reason)
-{
-  if (!missionSnapshot_.valid) {
-    RCLCPP_ERROR(node_->get_logger(), "Cannot return to snapshot on %s: no valid snapshot", reason);
-    return;
-  }
-
-  preTakeoffActive_ = false;
-  preTakeoffOverrideAltitudeMsl_.reset();
-  returnToSnapshotActive_ = true;
-  externalInterruptionNeutralModeSent_ = false;
-  resumeFlowState_ = ResumeFlowState::ReturnToSnapshot;
-  runtimeState_ = "return_to_snapshot";
-
-  RCLCPP_WARN(
-    node_->get_logger(),
-    "Return to snapshot on %s: lat=%.7f lon=%.7f alt=%.2f index=%d",
-    reason,
-    missionSnapshot_.position.x(),
-    missionSnapshot_.position.y(),
-    missionSnapshot_.position.z(),
-    missionSnapshot_.missionIndex);
-
-  publishState();
-}
-
-/**
- * @brief Gửi setpoint global để bay về snapshot.
- *
- * Logic:
- * - Khi còn xa snapshot thì update global goto setpoint.
- * - Khi đã gần hơn snapshotReturnAcceptanceM_ thì tắt return_to_snapshot.
- * - Khi return_to_snapshot tắt, missionControlBlocked() trả false và executor tiếp tục mission cũ.
- */
-void AdaptiveMissionNode::updateReturnToSnapshot()
-{
-  if (!returnToSnapshotActive_) {
-    return;
-  }
-
-  if (!active_) {
-    return;
-  }
-
-  if (!missionSnapshot_.valid || !snapshotGotoSetpoint_) {
-    RCLCPP_ERROR_THROTTLE(
+    RCLCPP_WARN_THROTTLE(
       node_->get_logger(),
       *node_->get_clock(),
-      1000,
-      "Cannot return to snapshot: snapshot or goto setpoint is invalid");
+      3000,
+      "Adaptive activation ignored after external RTL/LAND completion. Holding POSCTL until a fresh Adaptive selection.");
+
+    if (landed_ && armed_) {
+      sendDisarmThrottled();
+    }
+
+    posctlSentForCurrentState_ = false;
+    sendPosctlOnce();
+    externalLandingPosctlSent_ = true;
     return;
   }
 
-  if (!globalPosition_ || !globalPosition_->positionValid()) {
-    RCLCPP_ERROR_THROTTLE(
+  if (modeDeactivatedEvent_) {
+    modeDeactivatedEvent_ = false;
+
+    if (state_ == RuntimeState::Running || state_ == RuntimeState::ReturnToSnapshot) {
+      if (missionSnapshot_.valid && missionLoaded_ && runtimeMissionLoaded_ && !missionFinished_) {
+        enterState(RuntimeState::ExternalInterruptedWaitSelection, "Adaptive Mode deactivated during mission");
+      }
+    }
+  }
+
+  if (modeActivatedEvent_) {
+    modeActivatedEvent_ = false;
+
+    if (state_ == RuntimeState::WaitAdaptiveActivation) {
+      enterState(RuntimeState::Running, "Adaptive Mode activated");
+      return;
+    }
+
+    if (state_ == RuntimeState::WaitAdaptiveActivationForResume) {
+      enterReturnToSnapshot("Adaptive Mode activated for resume");
+      return;
+    }
+
+    if (state_ == RuntimeState::NoMissionStandby) {
+      RCLCPP_WARN_THROTTLE(
+        node_->get_logger(),
+        *node_->get_clock(),
+        3000,
+        "Adaptive Mode is active but no mission is cached. Waiting for mission_json.");
+    }
+  }
+
+  if (!adaptiveRisingEdge_) {
+    return;
+  }
+
+  adaptiveRisingEdge_ = false;
+
+  if (state_ == RuntimeState::ExternalInterruptedWaitSelection) {
+    resumeRequiresFreshAdaptiveSelection_ = false;
+    externalLandingPosctlSent_ = false;
+    externalLandingParked_ = false;
+
+    if (!missionSnapshot_.valid) {
+      enterState(RuntimeState::Error, "Cannot resume: no mission snapshot");
+      return;
+    }
+
+    const double snapshotAltitudeMsl = missionSnapshot_.position.z();
+
+    if (autoTakeoff_ && needPreTakeoff(snapshotAltitudeMsl)) {
+      enterPreTakeoff("Adaptive selected again after external interruption", snapshotAltitudeMsl);
+    } else if (adaptiveModeActive_ || adaptiveModeSelected()) {
+      enterReturnToSnapshot("Adaptive selected again and mode already active");
+    } else {
+      enterState(RuntimeState::WaitAdaptiveActivationForResume, "Waiting Adaptive activation before return to snapshot");
+      sendAdaptiveModeThrottled();
+    }
+
+    return;
+  }
+
+  if (!cachedMissionAvailable_ && pendingMissionText_.empty() && !runtimeMissionLoaded_) {
+    enterState(RuntimeState::NoMissionStandby, "Adaptive selected without cached mission");
+
+    RCLCPP_WARN_THROTTLE(
       node_->get_logger(),
       *node_->get_clock(),
-      1000,
-      "Cannot return to snapshot: no valid global position");
+      3000,
+      "Adaptive Mode selected but no mission is cached. Publish mission_json or run fc_mission_reader.");
+
     return;
   }
 
-  const Eigen::Vector3d current = globalPosition_->position();
-  const Eigen::Vector3d target = missionSnapshot_.position;
-  const float distanceM = distance3dM(current, target);
+  if (!runtimeMissionLoaded_) {
+    enterState(RuntimeState::LoadingMission, "Adaptive selected with cached mission");
 
-  if (distanceM <= static_cast<float>(snapshotReturnAcceptanceM_)) {
-    returnToSnapshotActive_ = false;
-    externalInterrupted_ = false;
-    resumeFlowState_ = ResumeFlowState::None;
+    if (!loadCachedMissionForExecution("Adaptive Mode selected")) {
+      return;
+    }
+  }
+
+  /*
+   * MissionExecutor có thể cập nhật missionReady_ trễ hơn setMission().
+   * Vì vậy không coi missionReady=false ngay sau setMission là lỗi.
+   * State LoadingMission sẽ tự chuyển tiếp khi onReadynessUpdate báo ready.
+   */
+  enterState(RuntimeState::LoadingMission, "Waiting mission readiness");
+}
+
+/**
+ * @brief Cập nhật state machine và gửi command PX4 nếu state cần command.
+ */
+void AdaptiveMissionNode::updateRuntimeState()
+{
+  switch (state_) {
+    case RuntimeState::NoMissionStandby:
+      /*
+       * Không có mission thì không giữ UAV trong custom mode.
+       * Chỉ gửi POSCTL một lần để rời Adaptive an toàn, không spam command.
+       */
+      sendPosctlOnce();
+      break;
+
+    case RuntimeState::LoadingMission:
+      if (missionLoaded_ && missionReady_) {
+        const double takeoffAltitudeMsl = targetTakeoffAltitudeMsl();
+
+        if (autoTakeoff_ && ((autoArm_ && !armed_) || needPreTakeoff(takeoffAltitudeMsl))) {
+          enterPreTakeoff("Mission ready", std::nullopt);
+        } else if (adaptiveModeActive_ || adaptiveModeSelected()) {
+          enterState(RuntimeState::Running, "Mission ready and Adaptive Mode active");
+        } else {
+          enterState(RuntimeState::WaitAdaptiveActivation, "Mission ready, waiting Adaptive activation");
+          sendAdaptiveModeThrottled();
+        }
+      }
+      break;
+
+    case RuntimeState::PreTakeoff:
+    case RuntimeState::ResumeTakeoff:
+      updatePreTakeoff();
+      break;
+
+    case RuntimeState::WaitAdaptiveActivation:
+    case RuntimeState::WaitAdaptiveActivationForResume:
+      updateWaitAdaptiveActivation();
+      break;
+
+    case RuntimeState::ExternalInterruptedWaitSelection:
+      updateExternalInterruptedWaitSelection();
+      break;
+
+    case RuntimeState::ReturnToSnapshot:
+      updateReturnToSnapshot();
+      break;
+
+    default:
+      break;
+  }
+}
+
+/**
+ * @brief Đổi state runtime có log và reset throttle command cần thiết.
+ */
+void AdaptiveMissionNode::enterState(RuntimeState nextState, const char * reason)
+{
+  if (state_ == nextState) {
+    return;
+  }
+
+  state_ = nextState;
+  posctlSentForCurrentState_ = false;
+
+  if (state_ != RuntimeState::PreTakeoff && state_ != RuntimeState::ResumeTakeoff) {
     preTakeoffOverrideAltitudeMsl_.reset();
-    runtimeState_ = "mission";
-
-    RCLCPP_WARN(
-      node_->get_logger(),
-      "Returned to mission snapshot. Unblocking old mission executor from index=%d",
-      missionSnapshot_.missionIndex);
-
-    publishState();
-    return;
   }
 
-  std::optional<float> yawRad{};
-
-  if (distance2dM(current, target) > 0.1F) {
-    yawRad = headingRad(current, target);
+  if (state_ != RuntimeState::ReturnToSnapshot) {
+    lastReturnToSnapshotLog_ = rclcpp::Time{};
   }
-
-  snapshotGotoSetpoint_->update(
-    target,
-    yawRad,
-    snapshotReturnHorizontalVelocity_,
-    snapshotReturnVerticalVelocity_,
-    snapshotReturnMaxHeadingRate_);
-
-  const auto now = node_->now();
-
-  if (lastReturnToSnapshotLog_.nanoseconds() == 0 ||
-    (now - lastReturnToSnapshotLog_).seconds() > 1.0)
-  {
-    lastReturnToSnapshotLog_ = now;
-
-    RCLCPP_INFO(
-      node_->get_logger(),
-      "Returning to snapshot: distance=%.2f m",
-      distanceM);
-  }
-}
-
-/**
- * @brief Đưa PX4 về mode trung tính sau khi external interruption đã hạ cánh.
- *
- * Logic:
- * - Khi user chọn RTL/LAND/HOME, node chỉ lưu snapshot và chờ.
- * - Sau khi PX4 đã landed/disarmed, gửi POSCTL một lần để xóa user-intention
- *   Adaptive cũ còn sót lại trong PX4/QGC.
- * - Nhờ vậy node không tự resume do trạng thái cũ, mà chỉ resume khi user
- *   thật sự chọn Adaptive Mode lại sau đó.
- */
-void AdaptiveMissionNode::settleExternalInterruptionIfNeeded()
-{
-  if (!externalInterrupted_ ||
-    resumeFlowState_ != ResumeFlowState::InterruptedWaitSelection ||
-    externalInterruptionNeutralModeSent_)
-  {
-    return;
-  }
-
-  if (!landed_ || armed_) {
-    return;
-  }
-
-  externalInterruptionNeutralModeSent_ = true;
-  lastAdaptiveNavActive_ = false;
 
   RCLCPP_WARN(
     node_->get_logger(),
-    "External interruption settled after landed/disarmed. Switching PX4 to POSCTL and waiting for a fresh Adaptive Mode selection.");
+    "Runtime state -> %s (%s)",
+    runtimeStateName(),
+    reason);
 
-  px4Command_->posctl();
   publishState();
 }
 
 /**
- * @brief Kiểm tra pre-takeoff riêng cho case quay lại snapshot.
+ * @brief Bắt đầu auto ARM/TAKEOFF.
+ *
+ * Nếu overrideAltitudeMsl có giá trị, đây là resume về snapshot.
+ * Nếu không có, dùng altitude takeoff của mission.
  */
-bool AdaptiveMissionNode::shouldUseSnapshotTakeoff() const
+void AdaptiveMissionNode::enterPreTakeoff(
+  const char * reason,
+  std::optional<double> overrideAltitudeMsl)
+{
+  preTakeoffOverrideAltitudeMsl_ = overrideAltitudeMsl;
+  resetCommandTimers();
+
+  if (overrideAltitudeMsl) {
+    enterState(RuntimeState::ResumeTakeoff, reason);
+  } else {
+    enterState(RuntimeState::PreTakeoff, reason);
+  }
+}
+
+/**
+ * @brief Bắt đầu bay về snapshot.
+ */
+void AdaptiveMissionNode::enterReturnToSnapshot(const char * reason)
 {
   if (!missionSnapshot_.valid) {
-    return false;
+    enterState(RuntimeState::Error, "Cannot return to snapshot: no valid snapshot");
+    return;
   }
 
-  if (autoArm_ && !armed_) {
-    return true;
-  }
-
-  const double currentAltitude = currentAltitudeMsl();
-  const double targetAltitude = missionSnapshot_.position.z();
-
-  return !hasValidNumber(currentAltitude) ||
-    currentAltitude < targetAltitude - takeoffAcceptanceM_;
+  resetCommandTimers();
+  enterState(RuntimeState::ReturnToSnapshot, reason);
 }
 
 /**
- * @brief Trả về true khi executor mission cũ phải tạm ngưng gửi setpoint.
+ * @brief Mission hoàn thành: xóa cache/runtime/snapshot và chuyển POSCTL một lần.
  */
-bool AdaptiveMissionNode::missionControlBlocked() const
+void AdaptiveMissionNode::handleMissionCompleted()
 {
-  return preTakeoffActive_ ||
-    returnToSnapshotActive_ ||
-    resumeFlowState_ == ResumeFlowState::ResumeTakeoff ||
-    resumeFlowState_ == ResumeFlowState::WaitAdaptiveActivation ||
-    resumeFlowState_ == ResumeFlowState::ReturnToSnapshot;
-}
-
-const char * AdaptiveMissionNode::resumeFlowStateName() const
-{
-  switch (resumeFlowState_) {
-    case ResumeFlowState::None:
-      return "none";
-
-    case ResumeFlowState::InterruptedWaitSelection:
-      return "interrupted_wait_selection";
-
-    case ResumeFlowState::ResumeTakeoff:
-      return "resume_takeoff";
-
-    case ResumeFlowState::WaitAdaptiveActivation:
-      return "wait_adaptive_activation";
-
-    case ResumeFlowState::ReturnToSnapshot:
-      return "return_to_snapshot";
-  }
-
-  return "unknown";
-}
-
-/**
- * @brief Reset toàn bộ mission/cache/snapshot bằng topic ~/reset.
- */
-void AdaptiveMissionNode::requestReset()
-{
-  missionFinished_ = false;
-  externalInterrupted_ = false;
-  returnToSnapshotActive_ = false;
-  noCachedMissionRejectActive_ = false;
-  resumeFlowState_ = ResumeFlowState::None;
-  missionSnapshot_ = MissionSnapshot{};
-  preTakeoffOverrideAltitudeMsl_.reset();
-
+  missionFinished_ = true;
   clearMissionMemory(true);
-  runtimeState_ = "idle";
+  enterState(RuntimeState::Completed, "Mission completed");
+  sendPosctlOnce();
 
-  px4Command_->posctl();
-
-  RCLCPP_WARN(node_->get_logger(), "Mission memory reset by ~/reset topic");
-
-  publishState();
+  RCLCPP_WARN(
+    node_->get_logger(),
+    "Mission completed. Mission cache/runtime/snapshot cleared.");
 }
 
-bool AdaptiveMissionNode::fmuTopicsVisible() const
-{
-  const std::string statusTopic =
-    "fmu/out/vehicle_status" +
-    px4_ros2::getMessageNameVersion<px4_msgs::msg::VehicleStatus>();
-
-  return node_->count_publishers(statusTopic) > 0;
-}
-
+/**
+ * @brief Register Adaptive Mission Mode khi FMU DDS đã xuất hiện.
+ */
 void AdaptiveMissionNode::registerModeIfNeeded()
 {
   if (modeRegistered_) {
@@ -808,21 +632,25 @@ void AdaptiveMissionNode::registerModeIfNeeded()
   }
 }
 
+/**
+ * @brief Cache mission JSON thô.
+ *
+ * Logic:
+ * - Nếu mission đang chạy thì bỏ qua mission mới; reset bằng ~/reset trước nếu muốn thay mission.
+ * - Nếu mission chưa chạy thì lưu text, chưa parse, chưa setMission.
+ */
 void AdaptiveMissionNode::cacheMissionText(const std::string & text)
 {
-  if (active_ || runtimeMissionLoaded_ || resumePending_ || pauseResume_.running() ||
-    externalInterrupted_ || returnToSnapshotActive_)
-  {
+  if (!canAcceptNewMission()) {
     RCLCPP_WARN_THROTTLE(
       node_->get_logger(),
       *node_->get_clock(),
       3000,
-      "Mission message cached later is ignored while a mission/resume flow is running");
-
+      "Mission message ignored because a runtime mission is active. Use ~/reset before loading a new mission.");
     return;
   }
 
-  const auto key = missionKey(text);
+  const std::string key = missionKey(text);
 
   if (cachedMissionAvailable_ && key == cachedMissionKey_) {
     return;
@@ -839,30 +667,28 @@ void AdaptiveMissionNode::cacheMissionText(const std::string & text)
   missionLoaded_ = false;
   runtimeMissionLoaded_ = false;
   missionReady_ = false;
-  noCachedMissionRejectActive_ = false;
-  sourceMissionKey_.clear();
+  missionFinished_ = false;
+  resumeRequiresFreshAdaptiveSelection_ = false;
+  externalLandingPosctlSent_ = false;
+  externalLandingParked_ = false;
+
   plan_ = PlanInfo{};
   currentMissionIndex_ = -1;
-  runtimeState_ = "mission_cached_wait_mode";
-
-  missionFinished_ = false;
-  externalInterrupted_ = false;
-  externalInterruptionNeutralModeSent_ = false;
-  returnToSnapshotActive_ = false;
-  resumeFlowState_ = ResumeFlowState::None;
   missionSnapshot_ = MissionSnapshot{};
-  preTakeoffOverrideAltitudeMsl_.reset();
 
   altitudeOffset_.reset();
 
+  enterState(RuntimeState::MissionCachedWaitMode, "Mission JSON cached");
+
   RCLCPP_INFO(
     node_->get_logger(),
-    "Cached mission hash=%s. It will be parsed and loaded only after Adaptive Mission Mode is selected.",
+    "Cached mission hash=%s. Select Adaptive Mission Mode to load and execute it.",
     cachedMissionKey_.c_str());
-
-  publishState();
 }
 
+/**
+ * @brief Parse mission cache và set vào executor.
+ */
 bool AdaptiveMissionNode::loadCachedMissionForExecution(const char * reason)
 {
   if (runtimeMissionLoaded_ && missionLoaded_) {
@@ -870,18 +696,7 @@ bool AdaptiveMissionNode::loadCachedMissionForExecution(const char * reason)
   }
 
   if (!cachedMissionAvailable_ && pendingMissionText_.empty()) {
-    runtimeState_ = "reject_no_cached_mission";
-
-    RCLCPP_ERROR_THROTTLE(
-      node_->get_logger(),
-      *node_->get_clock(),
-      3000,
-      "Cannot load mission on %s: no cached mission from %s or %s",
-      reason,
-      missionTopic_.c_str(),
-      fcMissionTopic_.c_str());
-
-    publishState();
+    enterState(RuntimeState::NoMissionStandby, "Cannot load mission: no cache");
     return false;
   }
 
@@ -892,7 +707,6 @@ bool AdaptiveMissionNode::loadCachedMissionForExecution(const char * reason)
     plan_ = parsePlan(text, currentAltitudeMsl());
     executor_->setMission(px4_ros2::Mission(plan_.json));
 
-    sourceMissionKey_ = key;
     pendingMission_ = false;
     pendingMissionText_.clear();
     pendingMissionKey_.clear();
@@ -900,11 +714,11 @@ bool AdaptiveMissionNode::loadCachedMissionForExecution(const char * reason)
     missionLoaded_ = true;
     runtimeMissionLoaded_ = true;
     missionFinished_ = false;
-    externalInterrupted_ = false;
-    returnToSnapshotActive_ = false;
-    resumeFlowState_ = ResumeFlowState::None;
+    resumeRequiresFreshAdaptiveSelection_ = false;
+    externalLandingPosctlSent_ = false;
+    externalLandingParked_ = false;
     currentMissionIndex_ = -1;
-    runtimeState_ = "mission_loaded_on_mode_select";
+    cachedMissionKey_ = key;
 
     missionSnapshot_ = MissionSnapshot{};
     preTakeoffOverrideAltitudeMsl_.reset();
@@ -924,70 +738,56 @@ bool AdaptiveMissionNode::loadCachedMissionForExecution(const char * reason)
   } catch (const std::exception & error) {
     const std::string errorText = error.what();
 
-    if (!hasValidNumber(currentAltitudeMsl()) && errorText.find("altitude") != std::string::npos) {
+    if (!hasValidCurrentAltitude() && errorText.find("altitude") != std::string::npos) {
       pendingMission_ = true;
       pendingMissionText_ = text;
       pendingMissionKey_ = key;
-      runtimeState_ = "waiting_alt_ref";
+
+      enterState(RuntimeState::MissionCachedWaitMode, "Waiting valid altitude reference");
 
       RCLCPP_WARN(
         node_->get_logger(),
-        "Mission waits for valid global/home MSL altitude after mode select: %s",
+        "Mission waits for valid global/home MSL altitude: %s",
         error.what());
 
-      publishState();
       return false;
     }
 
     missionLoaded_ = false;
     runtimeMissionLoaded_ = false;
     missionReady_ = false;
-    runtimeState_ = "mission_rejected";
+
+    enterState(RuntimeState::Error, "Mission rejected");
 
     RCLCPP_ERROR(node_->get_logger(), "Mission rejected on %s: %s", reason, error.what());
-
-    publishState();
     return false;
   }
 }
 
+/**
+ * @brief Xóa mission runtime/cache/snapshot.
+ */
 void AdaptiveMissionNode::clearMissionMemory(bool clearCachedMission)
 {
   if (executor_) {
     executor_->abort();
   }
 
-  resumePending_ = false;
-  externalInterrupted_ = false;
-  externalInterruptionNeutralModeSent_ = false;
-  returnToSnapshotActive_ = false;
-  resumeFlowState_ = ResumeFlowState::None;
-  missionSnapshot_ = MissionSnapshot{};
-  preTakeoffOverrideAltitudeMsl_.reset();
-
-  pauseResume_.reset();
-  resumeMissionJson_ = nlohmann::json::object();
-  resumeInfoJson_ = nlohmann::json::object();
-
   pendingMission_ = false;
   pendingMissionText_.clear();
   pendingMissionKey_.clear();
 
-  sourceMissionKey_.clear();
   plan_ = PlanInfo{};
-
   missionLoaded_ = false;
   runtimeMissionLoaded_ = false;
   missionReady_ = false;
-
   currentMissionIndex_ = -1;
-  resumeIndex_ = 0;
-  resumeAltitudeOffsetM_ = 0.0F;
+  resumeRequiresFreshAdaptiveSelection_ = false;
+  externalLandingPosctlSent_ = false;
+  externalLandingParked_ = false;
 
-  preTakeoffActive_ = false;
-  preTakeoffSent_ = false;
-  preModeSent_ = false;
-
+  missionSnapshot_ = MissionSnapshot{};
+  preTakeoffOverrideAltitudeMsl_.reset();
   altitudeOffset_.reset();
 
   if (clearCachedMission) {
@@ -997,19 +797,9 @@ void AdaptiveMissionNode::clearMissionMemory(bool clearCachedMission)
   }
 }
 
-void AdaptiveMissionNode::retryPendingMissionIfReady()
-{
-  if (!pendingMission_ || active_) {
-    return;
-  }
-
-  if (!hasValidNumber(currentAltitudeMsl())) {
-    return;
-  }
-
-  loadCachedMissionForExecution("valid altitude reference became available");
-}
-
+/**
+ * @brief Start bằng topic ~/activate nếu được bật trong config.
+ */
 void AdaptiveMissionNode::requestStart(bool enabled)
 {
   if (!enabled) {
@@ -1024,262 +814,43 @@ void AdaptiveMissionNode::requestStart(bool enabled)
     return;
   }
 
-  if (!runtimeMissionLoaded_) {
-    loadCachedMissionForExecution("activate topic start");
-  }
-
-  if (!missionLoaded_ || !missionReady_) {
-    RCLCPP_ERROR(node_->get_logger(), "Cannot start: mission not ready");
-    return;
-  }
-
-  px4Command_->arm();
-  px4Command_->setMode(static_cast<float>(executor_->id()));
-
-  runtimeState_ = "start_request";
-  publishState();
+  adaptiveRisingEdge_ = true;
 }
 
+/**
+ * @brief Stop runtime mission nhưng giữ cache mission.
+ */
 void AdaptiveMissionNode::requestStop()
 {
-  if (executor_) {
-    executor_->abort();
-  }
-
-  active_ = false;
-  runtimeState_ = cachedMissionAvailable_ ? "mission_cached_wait_mode" : "idle";
-
   clearMissionMemory(false);
 
-  publishState();
+  if (cachedMissionAvailable_) {
+    enterState(RuntimeState::MissionCachedWaitMode, "Stop requested, mission cache kept");
+  } else {
+    enterState(RuntimeState::Idle, "Stop requested");
+  }
 }
 
-bool AdaptiveMissionNode::saveResumeMission()
+/**
+ * @brief Reset toàn bộ bằng topic ~/reset.
+ */
+void AdaptiveMissionNode::requestReset()
 {
-  if (!missionLoaded_) {
-    RCLCPP_ERROR(node_->get_logger(), "Cannot pause: no mission to resume");
-    return false;
-  }
+  missionFinished_ = false;
+  clearMissionMemory(true);
+  enterState(RuntimeState::Idle, "Reset requested");
+  sendPosctlOnce();
 
-  if (!globalPosition_ || !globalPosition_->positionValid()) {
-    RCLCPP_ERROR(node_->get_logger(), "Cannot pause: no valid global position");
-    return false;
-  }
-
-  const auto position = globalPosition_->position();
-
-  ResumeMissionRequest request;
-  request.currentPlan = &plan_;
-  request.pauseGlobalPosition = position;
-  request.currentMissionIndex = currentMissionIndex_;
-  request.altitudeOffsetM = altitudeOffset_.offsetM();
-
-  try {
-    const auto result = ResumeMissionBuilder::build(request);
-
-    resumeMissionJson_ = result.resumeMissionJson;
-    resumeInfoJson_ = result.resumeInfoJson;
-    resumeIndex_ = result.resumeIndex;
-    resumeAltitudeOffsetM_ = request.altitudeOffsetM;
-    resumePending_ = true;
-
-    RCLCPP_WARN(
-      node_->get_logger(),
-      "Pause saved resume point lat=%.7f lon=%.7f alt=%.2f m, next index=%d, baked offset=%.2f m",
-      position.x(),
-      position.y(),
-      position.z(),
-      resumeIndex_,
-      resumeAltitudeOffsetM_);
-
-    return true;
-  } catch (const std::exception & error) {
-    RCLCPP_ERROR(node_->get_logger(), "Cannot save resume mission: %s", error.what());
-    return false;
-  }
+  RCLCPP_WARN(node_->get_logger(), "Mission memory reset by ~/reset topic");
 }
 
-bool AdaptiveMissionNode::applyResumeMission()
-{
-  if (!resumePending_) {
-    return false;
-  }
-
-  try {
-    px4_ros2::Mission mission(resumeMissionJson_);
-    executor_->setMission(mission);
-
-    plan_.json = resumeMissionJson_;
-    plan_.hash = mission.checksum();
-    plan_.sourceItemCount = resumeIndex_;
-    plan_.executableItemCount = static_cast<int>(
-      resumeMissionJson_.at("mission").at("items").size());
-    plan_.skippedItemCount = 0;
-    plan_.hasPreTakeoff = true;
-    plan_.takeoffAltitudeMsl = resumeMissionJson_.at("pre_takeoff_alt_msl").get<double>();
-
-    resumePending_ = false;
-    altitudeOffset_.reset();
-    currentMissionIndex_ = -1;
-    missionLoaded_ = true;
-    runtimeState_ = "continue_request";
-
-    RCLCPP_WARN(
-      node_->get_logger(),
-      "Continue mission loaded resume route: return to pause point, then continue with %d remaining items",
-      plan_.executableItemCount - 1);
-
-    return true;
-  } catch (const std::exception & error) {
-    RCLCPP_ERROR(node_->get_logger(), "Cannot apply resume mission: %s", error.what());
-    return false;
-  }
-}
-
-void AdaptiveMissionNode::requestPauseRtl()
-{
-  if (pauseResume_.running()) {
-    RCLCPP_WARN(node_->get_logger(), "Pause request ignored: pause/continue flow is already active");
-    publishState();
-    return;
-  }
-
-  if (!saveResumeMission()) {
-    return;
-  }
-
-  if (executor_) {
-    executor_->abort();
-  }
-
-  preTakeoffActive_ = false;
-  active_ = false;
-
-  pauseResume_.startPauseRtl(node_->now());
-  runtimeState_ = pauseResume_.stateName();
-
-  RCLCPP_WARN(node_->get_logger(), "Pause RTL requested: return home, disarm after landed, then wait continue");
-
-  px4Command_->rtl();
-  publishState();
-}
-
-void AdaptiveMissionNode::requestContinueMission()
-{
-  if (pauseResume_.waitingContinue()) {
-    if (!resumePending_) {
-      RCLCPP_ERROR(node_->get_logger(), "Cannot continue: no saved resume mission");
-      publishState();
-      return;
-    }
-
-    if (!applyResumeMission()) {
-      publishState();
-      return;
-    }
-
-    if (!pauseResume_.requestContinue()) {
-      RCLCPP_ERROR(node_->get_logger(), "Cannot continue: pause state is not waiting_continue");
-      publishState();
-      return;
-    }
-
-    pauseResume_.markResumeStarted();
-
-    if (autoTakeoff_) {
-      beginPreTakeoff("continue mission after pause RTL");
-    } else {
-      px4Command_->arm();
-      px4Command_->setMode(static_cast<float>(executor_->id()));
-      runtimeState_ = "continue_request";
-      publishState();
-    }
-
-    return;
-  }
-
-  if (pauseResume_.running()) {
-    RCLCPP_WARN(
-      node_->get_logger(),
-      "Continue ignored: pause flow is not ready yet, current phase=%s",
-      pauseResume_.stateName().c_str());
-
-    publishState();
-    return;
-  }
-
-  if (resumePending_ && !applyResumeMission()) {
-    publishState();
-    return;
-  }
-
-  if (!missionLoaded_) {
-    RCLCPP_ERROR(node_->get_logger(), "Cannot continue: no mission loaded");
-    publishState();
-    return;
-  }
-
-  if (autoTakeoff_ && (needPreTakeoff() || (autoArm_ && !armed_))) {
-    beginPreTakeoff("continue mission from inactive state");
-    return;
-  }
-
-  px4Command_->setMode(static_cast<float>(executor_->id()));
-
-  runtimeState_ = "continue_request";
-  publishState();
-}
-
-void AdaptiveMissionNode::updatePauseResume()
-{
-  if (!pauseResume_.running()) {
-    return;
-  }
-
-  const std::string oldState = runtimeState_;
-  const bool wasWaitingContinue = pauseResume_.waitingContinue();
-
-  PauseResumeUpdate input;
-  input.armed = armed_;
-  input.landed = landed_;
-  input.resumeMissionPending = resumePending_;
-  input.now = node_->now();
-
-  const auto action = pauseResume_.update(input);
-
-  if (pauseResume_.running()) {
-    runtimeState_ = pauseResume_.stateName();
-  }
-
-  const bool enteredWaitingContinue = pauseResume_.waitingContinue() && !wasWaitingContinue;
-
-  if (action.sendRtl) {
-    RCLCPP_WARN(node_->get_logger(), "Pause RTL flow: resend RTL command");
-    px4Command_->rtl();
-  }
-
-  if (action.sendDisarm) {
-    RCLCPP_WARN(node_->get_logger(), "Pause RTL flow: landed detected, sending DISARM");
-    px4Command_->disarm();
-  }
-
-  if (enteredWaitingContinue) {
-    /*
-     * RTL đã hạ cánh/disarm xong. Lúc này phải rời Adaptive Mission Mode
-     * và đứng yên ở POSCTL cho tới khi người dùng gửi continue_mission.
-     */
-    RCLCPP_WARN(
-      node_->get_logger(),
-      "Pause RTL flow: landed/disarmed, switching to POSCTL and waiting continue_mission");
-
-    px4Command_->posctl();
-  }
-
-  if (oldState != runtimeState_ || action.sendRtl || action.sendDisarm || enteredWaitingContinue) {
-    publishState();
-  }
-}
-
+/**
+ * @brief Cập nhật VehicleStatus và phát hiện cạnh lên/cạnh xuống Adaptive Mode.
+ *
+ * Lưu ý:
+ * - Không dùng nav_state_user_intention để auto start/resume.
+ * - user_intention chỉ publish ra state để debug.
+ */
 void AdaptiveMissionNode::handleVehicleStatus(const px4_msgs::msg::VehicleStatus & message)
 {
   navState_ = message.nav_state;
@@ -1287,149 +858,23 @@ void AdaptiveMissionNode::handleVehicleStatus(const px4_msgs::msg::VehicleStatus
   armingState_ = message.arming_state;
   executorInCharge_ = message.executor_in_charge;
   failsafe_ = message.failsafe;
-
   armed_ = message.arming_state == px4_msgs::msg::VehicleStatus::ARMING_STATE_ARMED;
 
-  registerModeIfNeeded();
+  const bool selectedNow = adaptiveModeSelected();
 
-  const auto modeId = executor_ ? static_cast<uint8_t>(executor_->id()) : uint8_t{};
+  adaptiveSelectedNow_ = selectedNow;
+  adaptiveRisingEdge_ = selectedNow && !adaptiveSelectedLast_;
+  adaptiveFallingEdge_ = !selectedNow && adaptiveSelectedLast_;
+  adaptiveSelectedLast_ = selectedNow;
 
-  const bool adaptiveNavActive =
-    modeRegistered_ &&
-    executor_ &&
-    navState_ == modeId;
-
-  const bool adaptiveNavRisingEdge = adaptiveNavActive && !lastAdaptiveNavActive_;
-
-  /*
-   * Cập nhật edge detector ở cuối hàm, kể cả khi có return sớm.
-   * Đây là điểm quan trọng để không bị resume tự động bởi nav_state_user_intention
-   * hoặc trạng thái Adaptive cũ còn sót lại sau RTL/LAND.
-   */
-  struct LastAdaptiveNavGuard
-  {
-    bool & storage;
-    bool value;
-
-    ~LastAdaptiveNavGuard()
-    {
-      storage = value;
-    }
-  } lastAdaptiveNavGuard{lastAdaptiveNavActive_, adaptiveNavActive};
-
-  /*
-   * Resume sau external interruption chỉ được khởi động bằng cạnh lên thật sự
-   * của nav_state Adaptive: false -> true.
-   *
-   * Không dùng nav_state_user_intention để resume vì PX4/QGC có thể giữ
-   * user_intention cũ sau RTL/LAND. Nếu dùng user_intention, node sẽ tự ARM
-   * và TAKEOFF lại dù người dùng chưa chọn Adaptive Mode lần nữa.
-   */
-  if (externalInterrupted_ && resumeFlowState_ == ResumeFlowState::InterruptedWaitSelection) {
-    if (!adaptiveNavRisingEdge) {
-      return;
-    }
-
-    if (!missionLoaded_ || !runtimeMissionLoaded_) {
-      RCLCPP_ERROR_THROTTLE(
-        node_->get_logger(),
-        *node_->get_clock(),
-        3000,
-        "Cannot resume external interruption: old runtime mission is not loaded");
-      return;
-    }
-
-    if (autoTakeoff_ && shouldUseSnapshotTakeoff()) {
-      preTakeoffOverrideAltitudeMsl_ = missionSnapshot_.position.z();
-      resumeFlowState_ = ResumeFlowState::ResumeTakeoff;
-      beginPreTakeoff("selected again after external mode interruption");
-      return;
-    }
-
-    beginReturnToSnapshot("selected again after external mode interruption");
-    return;
-  }
-
-  const bool blockedByPauseOrFinish =
-    pauseResume_.running() ||
-    resumePending_ ||
-    returnToSnapshotActive_ ||
-    resumeFlowState_ == ResumeFlowState::ResumeTakeoff ||
-    resumeFlowState_ == ResumeFlowState::WaitAdaptiveActivation ||
-    resumeFlowState_ == ResumeFlowState::ReturnToSnapshot ||
-    runtimeState_ == "done" ||
-    runtimeState_ == "pause_wait_continue";
-
-  if (adaptiveNavActive && blockedByPauseOrFinish && !preTakeoffActive_) {
-    return;
-  }
-
-  if (!adaptiveNavActive) {
-    noCachedMissionRejectActive_ = false;
-  }
-
-  if (adaptiveNavActive && !externalInterrupted_ && !active_ && !preTakeoffActive_ &&
-    !runtimeMissionLoaded_)
-  {
-    const bool hasMissionToLoad = cachedMissionAvailable_ || !pendingMissionText_.empty();
-
-    if (!hasMissionToLoad) {
-      if (!noCachedMissionRejectActive_) {
-        noCachedMissionRejectActive_ = true;
-        runtimeState_ = "wait_mission_cache";
-
-        RCLCPP_WARN(
-          node_->get_logger(),
-          "Adaptive Mission Mode selected but no mission is cached. Waiting for mission_json; node will stay alive and will not force POSCTL.");
-
-        /*
-         * Không gửi POSCTL khi thiếu mission.
-         *
-         * Lý do:
-         * - Drone không phải lúc nào cũng có mission để cache sẵn.
-         * - Nếu ép rời custom mode tại đây, px4_ros2 có thể không nhận request
-         *   từ FMU nữa và ném exception: "Timeout, no request received from FMU".
-         * - Giữ node ở trạng thái wait_mission_cache giúp mission_json tới sau
-         *   vẫn được cache và load bình thường.
-         */
-        publishState();
-      }
-
-      return;
-    }
-
-    noCachedMissionRejectActive_ = false;
-    loadCachedMissionForExecution("Adaptive Mission Mode selected");
-  }
-
-  if (adaptiveNavActive && !externalInterrupted_ && !active_ && !preTakeoffActive_ &&
-    missionLoaded_ && missionReady_ && autoTakeoff_ &&
-    (needPreTakeoff() || (autoArm_ && !armed_)))
-  {
-    beginPreTakeoff("selected by nav_state before activation");
-  }
-
-  if (adaptiveNavActive && !active_ && !preTakeoffActive_) {
-    const auto now = node_->now();
-
-    if (lastSelectWatchLog_.nanoseconds() == 0 ||
-      (now - lastSelectWatchLog_).seconds() > 2.0)
-    {
-      lastSelectWatchLog_ = now;
-
-      RCLCPP_WARN(
-        node_->get_logger(),
-        "Adaptive selected but executor is not active yet: armed=%d nav_state=%u user_intention=%u executor=%u mode_id=%u resume_flow=%s",
-        armed_ ? 1 : 0,
-        navState_,
-        userIntentNavState_,
-        executorInCharge_,
-        modeId,
-        resumeFlowStateName());
-    }
+  if (adaptiveFallingEdge_) {
+    modeDeactivatedEvent_ = true;
   }
 }
 
+/**
+ * @brief Log ACK/NACK các command do node gửi.
+ */
 void AdaptiveMissionNode::handleCommandAck(const px4_msgs::msg::VehicleCommandAck & message)
 {
   const bool isCommandMine =
@@ -1461,40 +906,70 @@ void AdaptiveMissionNode::handleCommandAck(const px4_msgs::msg::VehicleCommandAc
   }
 }
 
+/**
+ * @brief Cập nhật landed flag từ PX4.
+ */
 void AdaptiveMissionNode::handleVehicleLandDetected(
   const px4_msgs::msg::VehicleLandDetected & message)
 {
   landed_ = message.landed;
+
+  if (landed_ &&
+    state_ == RuntimeState::ExternalInterruptedWaitSelection &&
+    !externalLandingParked_)
+  {
+    resumeRequiresFreshAdaptiveSelection_ = true;
+    externalLandingPosctlSent_ = false;
+    posctlSentForCurrentState_ = false;
+    adaptiveRisingEdge_ = false;
+    modeActivatedEvent_ = false;
+  }
 }
 
-void AdaptiveMissionNode::beginPreTakeoff(const char * reason)
+/**
+ * @brief Lưu snapshot vị trí khi mission đang RUNNING.
+ */
+void AdaptiveMissionNode::updateMissionSnapshot()
 {
-  preTakeoffActive_ = true;
-  preTakeoffSent_ = false;
-  preModeSent_ = false;
-  runtimeState_ = "pre_takeoff";
-
-  if (!externalInterrupted_) {
-    currentMissionIndex_ = -1;
+  if (state_ != RuntimeState::Running) {
+    return;
   }
 
-  lastArmCommand_ = rclcpp::Time{};
-  lastTakeoffCommand_ = rclcpp::Time{};
-  lastModeCommand_ = rclcpp::Time{};
+  if (!globalPosition_ || !globalPosition_->positionValid()) {
+    return;
+  }
 
-  RCLCPP_WARN(
-    node_->get_logger(),
-    "Adaptive %s: auto ARM + MAV_CMD_NAV_TAKEOFF first",
-    reason);
+  missionSnapshot_.valid = true;
+  missionSnapshot_.position = globalPosition_->position();
+  missionSnapshot_.missionIndex = currentMissionIndex_;
+  missionSnapshot_.altitudeOffsetM = altitudeOffset_.offsetM();
+  missionSnapshot_.missionHash = plan_.hash;
 
-  publishState();
+  const auto now = node_->now();
+
+  if (lastSnapshotLog_.nanoseconds() == 0 ||
+    (now - lastSnapshotLog_).seconds() > 5.0)
+  {
+    lastSnapshotLog_ = now;
+
+    RCLCPP_INFO(
+      node_->get_logger(),
+      "Mission snapshot lat=%.7f lon=%.7f alt=%.2f index=%d offset=%.2f",
+      missionSnapshot_.position.x(),
+      missionSnapshot_.position.y(),
+      missionSnapshot_.position.z(),
+      missionSnapshot_.missionIndex,
+      missionSnapshot_.altitudeOffsetM);
+  }
 }
 
+/**
+ * @brief Cập nhật offset độ cao theo cần ga.
+ */
 void AdaptiveMissionNode::updateAltitudeOffset()
 {
   const bool offsetEnabled =
-    active_ &&
-    !returnToSnapshotActive_ &&
+    state_ == RuntimeState::Running &&
     armed_ &&
     manualControl_ &&
     manualControl_->isValid();
@@ -1522,114 +997,357 @@ void AdaptiveMissionNode::updateAltitudeOffset()
   }
 }
 
+/**
+ * @brief State PRE_TAKEOFF/RESUME_TAKEOFF.
+ */
 void AdaptiveMissionNode::updatePreTakeoff()
 {
-  if (!preTakeoffActive_ || !missionLoaded_ || !missionReady_) {
+  if (!missionLoaded_ || !missionReady_) {
+    return;
+  }
+
+  if (autoArm_ && !armed_) {
+    sendArmThrottled();
+    return;
+  }
+
+  const double targetAltitudeMsl = activePreTakeoffTargetAltitudeMsl();
+
+  if (!hasValidNumber(targetAltitudeMsl)) {
+    enterState(RuntimeState::Error, "Pre-takeoff failed: invalid target altitude");
+    return;
+  }
+
+  if (needPreTakeoff(targetAltitudeMsl)) {
+    sendTakeoffThrottled(targetAltitudeMsl);
+    return;
+  }
+
+  if (state_ == RuntimeState::ResumeTakeoff) {
+    enterState(RuntimeState::WaitAdaptiveActivationForResume, "Resume takeoff reached target altitude");
+  } else {
+    enterState(RuntimeState::WaitAdaptiveActivation, "Pre-takeoff reached target altitude");
+  }
+
+  sendAdaptiveModeThrottled();
+}
+
+/**
+ * @brief State WAIT_ADAPTIVE_ACTIVATION*.
+ */
+void AdaptiveMissionNode::updateWaitAdaptiveActivation()
+{
+  if (adaptiveModeActive_ || adaptiveModeSelected()) {
+    if (state_ == RuntimeState::WaitAdaptiveActivationForResume) {
+      enterReturnToSnapshot("Adaptive Mode active while waiting resume activation");
+    } else {
+      enterState(RuntimeState::Running, "Adaptive Mode active while waiting mission activation");
+    }
+
+    return;
+  }
+
+  sendAdaptiveModeThrottled();
+}
+
+/**
+ * @brief State EXTERNAL_INTERRUPTED_WAIT_SELECTION.
+ *
+ * Nếu user chọn RTL/LAND trong lúc mission đang chạy, PX4 có thể quay lại custom mode
+ * theo user_intention cũ sau khi land. Khi đã landed, coi mission là parked: ép POSCTL
+ * và yêu cầu một lần chọn Adaptive mới thay vì tự arm/takeoff resume.
+ */
+void AdaptiveMissionNode::updateExternalInterruptedWaitSelection()
+{
+  if (!landed_) {
+    return;
+  }
+
+  /*
+   * Sau khi đã ép PX4 về POSCTL thành công, state này chỉ đứng yên chờ
+   * một cạnh lên Adaptive mới. Không reset lại cờ parking ở mỗi vòng lặp,
+   * nếu không node sẽ spam POSCTL và không bao giờ resume được.
+   */
+  if (externalLandingParked_) {
+    return;
+  }
+
+  if (!resumeRequiresFreshAdaptiveSelection_) {
+    resumeRequiresFreshAdaptiveSelection_ = true;
+    externalLandingPosctlSent_ = false;
+    posctlSentForCurrentState_ = false;
+    adaptiveRisingEdge_ = false;
+    modeActivatedEvent_ = false;
+
+    RCLCPP_WARN(
+      node_->get_logger(),
+      "External interruption landed. Parking mission in POSCTL; select Adaptive again to resume.");
+  }
+
+  if (armed_) {
+    sendDisarmThrottled();
+  }
+
+  if (!externalLandingPosctlSent_) {
+    sendPosctlOnce();
+    externalLandingPosctlSent_ = true;
+    return;
+  }
+
+  if (!adaptiveModeSelected() &&
+    navState_ == px4_msgs::msg::VehicleStatus::NAVIGATION_STATE_POSCTL &&
+    userIntentNavState_ == px4_msgs::msg::VehicleStatus::NAVIGATION_STATE_POSCTL)
+  {
+    resumeRequiresFreshAdaptiveSelection_ = false;
+    externalLandingPosctlSent_ = false;
+    externalLandingParked_ = true;
+
+    RCLCPP_WARN(
+      node_->get_logger(),
+      "Mission parked after external RTL/LAND. Waiting for a fresh Adaptive selection.");
+  }
+}
+
+/**
+ * @brief State RETURN_TO_SNAPSHOT.
+ */
+void AdaptiveMissionNode::updateReturnToSnapshot()
+{
+  if (!missionSnapshot_.valid || !snapshotGotoSetpoint_) {
+    enterState(RuntimeState::Error, "Cannot return to snapshot: invalid snapshot/goto setpoint");
+    return;
+  }
+
+  if (!globalPosition_ || !globalPosition_->positionValid()) {
+    RCLCPP_WARN_THROTTLE(
+      node_->get_logger(),
+      *node_->get_clock(),
+      1000,
+      "Waiting valid global position before returning to snapshot");
+    return;
+  }
+
+  const Eigen::Vector3d current = globalPosition_->position();
+  const Eigen::Vector3d target = missionSnapshot_.position;
+  const float distanceM = distance3dM(current, target);
+
+  if (distanceM <= static_cast<float>(snapshotReturnAcceptanceM_)) {
+    enterState(RuntimeState::Running, "Returned to snapshot, old mission executor unblocked");
+    return;
+  }
+
+  std::optional<float> yawRad{};
+
+  if (distance2dM(current, target) > 0.1F) {
+    yawRad = headingRad(current, target);
+  }
+
+  snapshotGotoSetpoint_->update(
+    target,
+    yawRad,
+    snapshotReturnHorizontalVelocity_,
+    snapshotReturnVerticalVelocity_,
+    snapshotReturnMaxHeadingRate_);
+
+  const auto now = node_->now();
+
+  if (lastReturnToSnapshotLog_.nanoseconds() == 0 ||
+    (now - lastReturnToSnapshotLog_).seconds() > 1.0)
+  {
+    lastReturnToSnapshotLog_ = now;
+
+    RCLCPP_INFO(
+      node_->get_logger(),
+      "Returning to snapshot: distance=%.2f m",
+      distanceM);
+  }
+}
+
+void AdaptiveMissionNode::sendArmThrottled()
+{
+  const auto now = node_->now();
+
+  if (lastArmCommand_.nanoseconds() != 0 &&
+    (now - lastArmCommand_).seconds() < 1.0)
+  {
+    return;
+  }
+
+  lastArmCommand_ = now;
+  RCLCPP_WARN(node_->get_logger(), "Sending ARM");
+  px4Command_->arm();
+}
+
+void AdaptiveMissionNode::sendDisarmThrottled()
+{
+  const auto now = node_->now();
+
+  if (lastDisarmCommand_.nanoseconds() != 0 &&
+    (now - lastDisarmCommand_).seconds() < 1.0)
+  {
+    return;
+  }
+
+  lastDisarmCommand_ = now;
+  RCLCPP_WARN(node_->get_logger(), "Sending DISARM");
+  px4Command_->disarm();
+}
+
+void AdaptiveMissionNode::sendTakeoffThrottled(double targetAltitudeMsl)
+{
+  const auto now = node_->now();
+
+  if (lastTakeoffCommand_.nanoseconds() != 0 &&
+    (now - lastTakeoffCommand_).seconds() < 2.0)
+  {
+    return;
+  }
+
+  float latitude = Px4CommandClient::nan();
+  float longitude = Px4CommandClient::nan();
+
+  if (globalPosition_ && globalPosition_->positionValid()) {
+    const auto position = globalPosition_->position();
+    latitude = static_cast<float>(position.x());
+    longitude = static_cast<float>(position.y());
+  }
+
+  lastTakeoffCommand_ = now;
+
+  RCLCPP_WARN(
+    node_->get_logger(),
+    "Sending MAV_CMD_NAV_TAKEOFF to %.2f m AMSL",
+    targetAltitudeMsl);
+
+  px4Command_->takeoff(static_cast<float>(targetAltitudeMsl), latitude, longitude);
+}
+
+void AdaptiveMissionNode::sendAdaptiveModeThrottled()
+{
+  if (!executor_) {
     return;
   }
 
   const auto now = node_->now();
 
-  if (autoArm_ && !armed_) {
-    if (lastArmCommand_.nanoseconds() == 0 || (now - lastArmCommand_).seconds() > 1.0) {
-      lastArmCommand_ = now;
-      runtimeState_ = "arming";
-
-      RCLCPP_WARN(node_->get_logger(), "Sending arm before MAV takeoff");
-
-      px4Command_->arm();
-      publishState();
-    }
-
-    return;
-  }
-
-  const double targetAltitude = targetTakeoffAltitudeMsl();
-  const double currentAltitude = currentAltitudeMsl();
-
-  if (!hasValidNumber(targetAltitude)) {
-    RCLCPP_ERROR(node_->get_logger(), "Pre-takeoff failed: no valid takeoff altitude MSL");
-
-    preTakeoffActive_ = false;
-    runtimeState_ = "idle";
-    publishState();
-    return;
-  }
-
-  if (hasValidNumber(currentAltitude) && currentAltitude >= targetAltitude - takeoffAcceptanceM_) {
-    if (!preModeSent_ || lastModeCommand_.nanoseconds() == 0 ||
-      (now - lastModeCommand_).seconds() > 1.0)
-    {
-      preModeSent_ = true;
-      lastModeCommand_ = now;
-
-      if (externalInterrupted_ && resumeFlowState_ == ResumeFlowState::ResumeTakeoff) {
-        resumeFlowState_ = ResumeFlowState::WaitAdaptiveActivation;
-      }
-
-      runtimeState_ = "select_adaptive_after_takeoff";
-
-      RCLCPP_WARN(node_->get_logger(), "Takeoff done, selecting Adaptive Mission Mode again");
-
-      px4Command_->setMode(static_cast<float>(executor_->id()));
-      publishState();
-    }
-
-    return;
-  }
-
-  if (!preTakeoffSent_ || lastTakeoffCommand_.nanoseconds() == 0 ||
-    (now - lastTakeoffCommand_).seconds() > 2.0)
+  if (lastModeCommand_.nanoseconds() != 0 &&
+    (now - lastModeCommand_).seconds() < 1.0)
   {
-    float latitude = Px4CommandClient::nan();
-    float longitude = Px4CommandClient::nan();
-
-    if (globalPosition_ && globalPosition_->positionValid()) {
-      const auto position = globalPosition_->position();
-      latitude = static_cast<float>(position.x());
-      longitude = static_cast<float>(position.y());
-    }
-
-    preTakeoffSent_ = true;
-    lastTakeoffCommand_ = now;
-    runtimeState_ = "mav_takeoff";
-
-    RCLCPP_WARN(
-      node_->get_logger(),
-      "Sending MAV_CMD_NAV_TAKEOFF to %.2f m AMSL",
-      targetAltitude);
-
-    px4Command_->takeoff(static_cast<float>(targetAltitude), latitude, longitude);
-    publishState();
+    return;
   }
+
+  lastModeCommand_ = now;
+
+  RCLCPP_WARN(node_->get_logger(), "Selecting Adaptive Mission Mode");
+  px4Command_->setMode(static_cast<float>(executor_->id()));
 }
 
-bool AdaptiveMissionNode::needPreTakeoff() const
+void AdaptiveMissionNode::sendPosctlOnce()
 {
-  if (preTakeoffOverrideAltitudeMsl_) {
-    const double currentAltitude = currentAltitudeMsl();
-
-    return !hasValidNumber(currentAltitude) ||
-      currentAltitude < *preTakeoffOverrideAltitudeMsl_ - takeoffAcceptanceM_;
+  if (posctlSentForCurrentState_) {
+    return;
   }
 
-  if (!plan_.hasPreTakeoff) {
+  posctlSentForCurrentState_ = true;
+  px4Command_->posctl();
+}
+
+void AdaptiveMissionNode::resetCommandTimers()
+{
+  lastArmCommand_ = rclcpp::Time{};
+  lastDisarmCommand_ = rclcpp::Time{};
+  lastTakeoffCommand_ = rclcpp::Time{};
+  lastModeCommand_ = rclcpp::Time{};
+}
+
+void AdaptiveMissionNode::publishStateThrottled()
+{
+  const auto now = node_->now();
+
+  if (lastStatePublish_.nanoseconds() != 0 &&
+    (now - lastStatePublish_).seconds() < statePublishPeriodS_)
+  {
+    return;
+  }
+
+  lastStatePublish_ = now;
+  publishState();
+}
+
+bool AdaptiveMissionNode::fmuTopicsVisible() const
+{
+  const std::string statusTopic =
+    "fmu/out/vehicle_status" +
+    px4_ros2::getMessageNameVersion<px4_msgs::msg::VehicleStatus>();
+
+  return node_->count_publishers(statusTopic) > 0;
+}
+
+bool AdaptiveMissionNode::canAcceptNewMission() const
+{
+  return !runtimeMissionLoaded_ &&
+    state_ != RuntimeState::PreTakeoff &&
+    state_ != RuntimeState::WaitAdaptiveActivation &&
+    state_ != RuntimeState::Running &&
+    state_ != RuntimeState::ExternalInterruptedWaitSelection &&
+    state_ != RuntimeState::ResumeTakeoff &&
+    state_ != RuntimeState::WaitAdaptiveActivationForResume &&
+    state_ != RuntimeState::ReturnToSnapshot;
+}
+
+bool AdaptiveMissionNode::missionControlBlocked() const
+{
+  return state_ == RuntimeState::PreTakeoff ||
+    state_ == RuntimeState::ResumeTakeoff ||
+    state_ == RuntimeState::WaitAdaptiveActivation ||
+    state_ == RuntimeState::WaitAdaptiveActivationForResume ||
+    state_ == RuntimeState::ExternalInterruptedWaitSelection ||
+    state_ == RuntimeState::ReturnToSnapshot;
+}
+
+bool AdaptiveMissionNode::needPreTakeoff(double targetAltitudeMsl) const
+{
+  const double currentAltitude = currentAltitudeMsl();
+
+  return !hasValidNumber(currentAltitude) ||
+    currentAltitude < targetAltitudeMsl - takeoffAcceptanceM_;
+}
+
+bool AdaptiveMissionNode::adaptiveModeSelected() const
+{
+  if (!modeRegistered_ || !executor_) {
     return false;
   }
 
-  const double targetAltitude = targetTakeoffAltitudeMsl();
-  const double currentAltitude = currentAltitudeMsl();
+  return navState_ == static_cast<uint8_t>(executor_->id());
+}
 
-  return hasValidNumber(targetAltitude) &&
-    (!hasValidNumber(currentAltitude) || currentAltitude < targetAltitude - takeoffAcceptanceM_);
+bool AdaptiveMissionNode::adaptiveModeRisingEdge() const
+{
+  return adaptiveRisingEdge_;
+}
+
+bool AdaptiveMissionNode::adaptiveModeFallingEdge() const
+{
+  return adaptiveFallingEdge_;
+}
+
+bool AdaptiveMissionNode::hasValidCurrentAltitude() const
+{
+  return hasValidNumber(currentAltitudeMsl());
+}
+
+double AdaptiveMissionNode::currentAltitudeMsl() const
+{
+  if (globalPosition_ && globalPosition_->positionValid()) {
+    return globalPosition_->position().z();
+  }
+
+  return std::numeric_limits<double>::quiet_NaN();
 }
 
 double AdaptiveMissionNode::targetTakeoffAltitudeMsl() const
 {
-  if (preTakeoffOverrideAltitudeMsl_) {
-    return *preTakeoffOverrideAltitudeMsl_;
-  }
-
   if (plan_.takeoffAltitudeMsl) {
     return *plan_.takeoffAltitudeMsl;
   }
@@ -1648,25 +1366,59 @@ double AdaptiveMissionNode::targetTakeoffAltitudeMsl() const
   return std::numeric_limits<double>::quiet_NaN();
 }
 
-double AdaptiveMissionNode::currentAltitudeMsl() const
+double AdaptiveMissionNode::activePreTakeoffTargetAltitudeMsl() const
 {
-  if (globalPosition_ && globalPosition_->positionValid()) {
-    return globalPosition_->position().z();
+  if (preTakeoffOverrideAltitudeMsl_) {
+    return *preTakeoffOverrideAltitudeMsl_;
   }
 
-  return std::numeric_limits<double>::quiet_NaN();
+  return targetTakeoffAltitudeMsl();
 }
 
-nlohmann::json AdaptiveMissionNode::buildResumeStateJson() const
+const char * AdaptiveMissionNode::runtimeStateName() const
 {
-  if (!resumePending_) {
-    return {{"pending", false}};
+  switch (state_) {
+    case RuntimeState::Idle:
+      return "idle";
+
+    case RuntimeState::NoMissionStandby:
+      return "no_mission_standby";
+
+    case RuntimeState::MissionCachedWaitMode:
+      return "mission_cached_wait_mode";
+
+    case RuntimeState::LoadingMission:
+      return "loading_mission";
+
+    case RuntimeState::PreTakeoff:
+      return "pre_takeoff";
+
+    case RuntimeState::WaitAdaptiveActivation:
+      return "wait_adaptive_activation";
+
+    case RuntimeState::Running:
+      return "running";
+
+    case RuntimeState::ExternalInterruptedWaitSelection:
+      return "external_interrupted_wait_selection";
+
+    case RuntimeState::ResumeTakeoff:
+      return "resume_takeoff";
+
+    case RuntimeState::WaitAdaptiveActivationForResume:
+      return "wait_adaptive_activation_for_resume";
+
+    case RuntimeState::ReturnToSnapshot:
+      return "return_to_snapshot";
+
+    case RuntimeState::Completed:
+      return "completed";
+
+    case RuntimeState::Error:
+      return "error";
   }
 
-  auto resume = resumeInfoJson_;
-  resume["pending"] = true;
-
-  return resume;
+  return "unknown";
 }
 
 nlohmann::json AdaptiveMissionNode::buildMissionItemStateJson(int index) const
@@ -1708,7 +1460,7 @@ nlohmann::json AdaptiveMissionNode::buildMissionItemStateJson(int index) const
       {"altitude_offset_m", altitudeOffset_.offsetM()}};
   }
 
-  if (item.contains("altitude")) {
+  if (item.contains("altitude") && item.at("altitude").is_number()) {
     const double altitude = item.at("altitude").get<double>();
 
     output["target"] = {
@@ -1724,9 +1476,7 @@ nlohmann::json AdaptiveMissionNode::buildMissionItemsStateJson() const
 {
   nlohmann::json output = nlohmann::json::array();
 
-  const int itemCount = plan_.json.contains("executable_item_count") ?
-    plan_.json.at("executable_item_count").get<int>() :
-    0;
+  const int itemCount = plan_.executableItemCount;
 
   for (int index = 0; index < itemCount; ++index) {
     output.push_back(buildMissionItemStateJson(index));
@@ -1752,6 +1502,18 @@ nlohmann::json AdaptiveMissionNode::buildMissionSummaryJson() const
     mission["items_omitted"] = true;
   }
 
+  if (plan_.json.contains("remote_opaque_id")) {
+    mission["remote_opaque_id"] = plan_.json.at("remote_opaque_id");
+  }
+
+  if (plan_.json.contains("source_hash")) {
+    mission["source_hash"] = plan_.json.at("source_hash");
+  }
+
+  if (plan_.json.contains("skipped_source_items")) {
+    mission["skipped_source_items"] = plan_.json.at("skipped_source_items");
+  }
+
   return mission;
 }
 
@@ -1759,7 +1521,7 @@ nlohmann::json AdaptiveMissionNode::buildStateJson() const
 {
   nlohmann::json state;
 
-  state["state"] = runtimeState_;
+  state["state"] = runtimeStateName();
   state["mission_cached"] = cachedMissionAvailable_;
   state["mission_cached_hash"] = cachedMissionAvailable_ ?
     nlohmann::json(cachedMissionKey_) :
@@ -1768,29 +1530,16 @@ nlohmann::json AdaptiveMissionNode::buildStateJson() const
   state["mission_runtime_loaded"] = runtimeMissionLoaded_;
   state["mission_ready"] = missionLoaded_ && missionReady_;
   state["mission_pending_alt_ref"] = pendingMission_;
+  state["mission_finished"] = missionFinished_;
 
   state["px4_mode_registered"] = modeRegistered_;
-  state["px4_mode_id"] = static_cast<int>(executor_->id());
+  state["px4_mode_id"] = executor_ ? static_cast<int>(executor_->id()) : -1;
   state["fmu_topics_visible"] = fmuTopicsVisible();
 
-  state["mavlink_target"] = {
-    {"target_system", commandTarget_.targetSystem},
-    {"target_component", commandTarget_.targetComponent},
-    {"source_system", commandTarget_.sourceSystem},
-    {"source_component", commandTarget_.sourceComponent}};
-
-  state["active"] = active_;
-  state["mission_finished"] = missionFinished_;
-  state["external_interrupted"] = externalInterrupted_;
-  state["resume_flow_state"] = resumeFlowStateName();
-  state["return_to_snapshot_active"] = returnToSnapshotActive_;
-  state["mission_control_blocked"] = missionControlBlocked();
-  state["selected_by_status"] = modeRegistered_ && executor_ &&
-    executorInCharge_ == static_cast<uint8_t>(executor_->id());
+  state["active"] = adaptiveModeActive_;
+  state["selected_by_nav_state"] = adaptiveModeSelected();
   state["selected_by_user_intention"] = modeRegistered_ && executor_ &&
     userIntentNavState_ == static_cast<uint8_t>(executor_->id());
-  state["selected_by_nav_state"] = modeRegistered_ && executor_ &&
-    navState_ == static_cast<uint8_t>(executor_->id());
 
   state["armed"] = armed_;
   state["landed"] = landed_;
@@ -1800,17 +1549,10 @@ nlohmann::json AdaptiveMissionNode::buildStateJson() const
   state["executor_in_charge"] = executorInCharge_;
   state["failsafe"] = failsafe_;
 
-  state["pre_takeoff_active"] = preTakeoffActive_;
-  state["pre_takeoff_sent"] = preTakeoffSent_;
-  state["pre_takeoff_alt_msl"] = hasValidNumber(targetTakeoffAltitudeMsl()) ?
-    nlohmann::json(targetTakeoffAltitudeMsl()) :
+  state["mission_control_blocked"] = missionControlBlocked();
+  state["pre_takeoff_alt_msl"] = hasValidNumber(activePreTakeoffTargetAltitudeMsl()) ?
+    nlohmann::json(activePreTakeoffTargetAltitudeMsl()) :
     nlohmann::json(nullptr);
-  state["pre_takeoff_override_alt_msl"] = preTakeoffOverrideAltitudeMsl_ ?
-    nlohmann::json(*preTakeoffOverrideAltitudeMsl_) :
-    nlohmann::json(nullptr);
-
-  state["pause_resume"] = pauseResume_.toJson();
-  state["pause_rtl_resume"] = buildResumeStateJson();
 
   state["mission_snapshot"] = {
     {"valid", missionSnapshot_.valid},
@@ -1830,18 +1572,6 @@ nlohmann::json AdaptiveMissionNode::buildStateJson() const
   state["altitude_offset_active"] = altitudeOffset_.active();
 
   state["mission"] = buildMissionSummaryJson();
-
-  if (plan_.json.contains("remote_opaque_id")) {
-    state["mission"]["remote_opaque_id"] = plan_.json.at("remote_opaque_id");
-  }
-
-  if (plan_.json.contains("source_hash")) {
-    state["mission"]["source_hash"] = plan_.json.at("source_hash");
-  }
-
-  if (plan_.json.contains("skipped_source_items")) {
-    state["mission"]["skipped_source_items"] = plan_.json.at("skipped_source_items");
-  }
 
   if (globalPosition_ && globalPosition_->positionValid()) {
     const auto position = globalPosition_->position();
@@ -1870,7 +1600,7 @@ void AdaptiveMissionNode::publishState()
     message.data = buildStateJson().dump();
   } catch (const std::exception & error) {
     message.data = nlohmann::json{
-      {"state", runtimeState_},
+      {"state", runtimeStateName()},
       {"state_error", error.what()}}.dump();
   }
 

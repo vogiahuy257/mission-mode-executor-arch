@@ -2,33 +2,38 @@
 
 #include <ament_index_cpp/get_package_share_directory.hpp>
 
+#include <fcntl.h>
 #include <sys/select.h>
 
 #include <algorithm>
-#include <chrono>
 #include <cctype>
 #include <filesystem>
+#include <functional>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <sstream>
+#include <thread>
 
 namespace fc_mission_reader
 {
+
+using namespace std::chrono_literals;
 
 FcMissionReader::FcMissionReader(const rclcpp::NodeOptions & options)
 : Node("fc_mission_reader", options)
 {
   bind_ip_ = declare_parameter<std::string>("bind_ip", "0.0.0.0");
-  bind_port_ = declare_parameter<int>("bind_port", 14550);
-  poll_period_s_ = declare_parameter<double>("poll_period_s", 0.02);
-  read_budget_ms_ = declare_parameter<int>("read_budget_ms", 50);
-  transfer_timeout_s_ = declare_parameter<double>("transfer_timeout_s", 8.0);
-  publish_reset_on_mission_change_ = declare_parameter<bool>("publish_reset_on_mission_change", true);
-  publish_reset_on_startup_change_ = declare_parameter<bool>("publish_reset_on_startup_change", false);
-  reset_publish_min_interval_s_ = declare_parameter<double>("reset_publish_min_interval_s", 1.0);
-  adaptive_reset_topic_ = declare_parameter<std::string>("adaptive_reset_topic", "/adaptive_mission_mode/reset");
-  publish_unknown_on_remote_change_ = declare_parameter<bool>("publish_unknown_on_remote_change", true);
-  publish_empty_from_mission_current_ = declare_parameter<bool>("publish_empty_from_mission_current", true);
+  bind_port_ = declare_parameter<int>("bind_port", 14551);
+  target_ip_ = declare_parameter<std::string>("target_ip", "127.0.0.1");
+  target_port_ = declare_parameter<int>("target_port", 14550);
+  auto_target_ = declare_parameter<bool>("auto_target", true);
+  poll_period_s_ = declare_parameter<double>("poll_period_s", 1.0);
+  enable_fallback_count_poll_ = declare_parameter<bool>("enable_fallback_count_poll", true);
+  fallback_count_poll_s_ = declare_parameter<double>("fallback_count_poll_s", 5.0);
+  publish_cached_mission_continuously_ = declare_parameter<bool>("publish_cached_mission_continuously", true);
+  timeout_ms_ = declare_parameter<int>("timeout_ms", 3000);
+  retries_ = declare_parameter<int>("retries", 3);
   output_file_ = declare_parameter<std::string>("output_file", "");
 
   if (output_file_.empty()) {
@@ -36,30 +41,22 @@ FcMissionReader::FcMissionReader(const rclcpp::NodeOptions & options)
   }
 
   pub_ = create_publisher<std_msgs::msg::String>("~/mission_json", rclcpp::QoS(1).transient_local());
-  if (publish_reset_on_mission_change_ && !adaptive_reset_topic_.empty()) {
-    reset_pub_ = create_publisher<std_msgs::msg::Bool>(adaptive_reset_topic_, rclcpp::QoS(1).reliable());
-  }
-
   loadCache();
+  requestMissionSync("startup initial sync");
 
   if (!openSocket()) {
-    RCLCPP_ERROR(get_logger(), "Cannot open UDP socket. Passive observer cannot receive MAVLink.");
+    RCLCPP_ERROR(get_logger(), "Cannot open UDP socket. Reader will still run but cannot download mission.");
   }
 
-  const auto period = std::chrono::duration<double>(std::max(0.005, poll_period_s_));
-  timer_ = create_wall_timer(
-    std::chrono::duration_cast<std::chrono::milliseconds>(period),
+  const auto period = std::chrono::duration<double>(std::max(0.5, poll_period_s_));
+  timer_ = create_wall_timer(std::chrono::duration_cast<std::chrono::milliseconds>(period),
     std::bind(&FcMissionReader::poll, this));
 
-  RCLCPP_WARN(get_logger(),
-    "FC mission reader is running in PASSIVE OBSERVER mode: it never sends MAVLink mission requests or ACKs.");
-  RCLCPP_INFO(get_logger(),
-    "Listening MAVLink on %s:%d, output=%s, transfer_timeout=%.2fs",
-    bind_ip_.c_str(), bind_port_, output_file_.c_str(), transfer_timeout_s_);
-  RCLCPP_INFO(get_logger(),
-    "Publish policy: mission_json only on observed upload/download/clear/empty/unknown events; reset=%s topic=%s startup_reset=%s",
-    (publish_reset_on_mission_change_ && reset_pub_) ? "true" : "false",
-    adaptive_reset_topic_.c_str(), publish_reset_on_startup_change_ ? "true" : "false");
+  RCLCPP_INFO(get_logger(), "FC mission reader ready: bind %s:%d, auto_target=%s, fallback target %s:%d, output %s",
+    bind_ip_.c_str(), bind_port_, auto_target_ ? "true" : "false", target_ip_.c_str(), target_port_, output_file_.c_str());
+  RCLCPP_INFO(get_logger(), "Event-sync v4 mode: publish_cached_mission_continuously=%s, poll %.2fs, fallback_count_poll=%s %.2fs",
+    publish_cached_mission_continuously_ ? "true" : "false", poll_period_s_,
+    enable_fallback_count_poll_ ? "true" : "false", fallback_count_poll_s_);
 }
 
 FcMissionReader::~FcMissionReader()
@@ -91,27 +88,449 @@ bool FcMissionReader::openSocket()
     return false;
   }
 
+  target_addr_.sin_family = AF_INET;
+  target_addr_.sin_port = htons(static_cast<uint16_t>(target_port_));
+  target_addr_.sin_addr.s_addr = inet_addr(target_ip_.c_str());
   return true;
 }
 
 void FcMissionReader::poll()
 {
-  if (sock_ < 0) {
+  if (busy_ || sock_ < 0) {
     return;
   }
 
+  busy_ = true;
+  drainEvents(20);
+
+  const bool due_count_poll = shouldPollMissionInfo();
+  if (!force_download_ && !shouldInitialDownload() && !due_count_poll) {
+    publishCachedMissionContinuously();
+    busy_ = false;
+    return;
+  }
+
+  const bool was_initial_sync = !initial_sync_done_;
+  const std::string reason = force_download_ ? sync_reason_ :
+    (was_initial_sync ? "startup initial sync" : "fallback mission count poll");
+
+  uint16_t count = 0;
+  uint32_t opaque_id = 0;
+  bool info_ok = false;
+  for (int attempt = 0; attempt < retries_ && !info_ok; ++attempt) {
+    info_ok = readMissionInfo(count, opaque_id);
+  }
+  last_count_poll_ = now();
+
+  if (!info_ok) {
+    // Không publish lỗi lặp lại lên mission_json, vì topic này được dùng như dữ liệu mission.
+    // Nếu node đã thấy MISSION_CURRENT thì rõ ràng FC có telemetry; lỗi thường là sai endpoint
+    // gửi MISSION_REQUEST_LIST, không phải mission rỗng. Giữ cache hiện tại và chỉ log cảnh báo.
+    if (!initial_sync_done_ && !has_cache_ && !startup_failure_published_ && !remote_total_valid_) {
+      publishFailure("failed to read mission count from FC");
+      startup_failure_published_ = true;
+    }
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+      "Mission sync skipped, cannot read MISSION_COUNT from FC. reason=%s observed_total_valid=%s observed_total=%u observed_peer=%s",
+      reason.c_str(), remote_total_valid_ ? "true" : "false", remote_total_,
+      has_observed_peer_ ? addrText(observed_peer_addr_).c_str() : "none");
+    if (!force_download_ && initial_sync_done_) {
+      publishCachedMissionContinuously();
+    }
+    busy_ = false;
+    return;
+  }
+
+  startup_failure_published_ = false;
+  initial_sync_done_ = true;
+  remote_total_valid_ = true;
+  remote_total_ = count;
+  remote_reported_empty_ = (count == 0U);
+  if (opaque_id != 0U) {
+    remote_mission_id_valid_ = true;
+    remote_mission_id_ = opaque_id;
+  }
+
+  if (count == 0U) {
+    handleEmptyMission(opaque_id, reason, was_initial_sync);
+    force_download_ = false;
+    sync_reason_.clear();
+    busy_ = false;
+    return;
+  }
+
+  if (!force_download_ && !shouldDownload(count, opaque_id)) {
+    RCLCPP_DEBUG(get_logger(),
+      "Mission unchanged: count=%u opaque=%u cached_hash=%s", count, opaque_id, cached_hash_.c_str());
+    publishCachedMissionContinuously();
+    busy_ = false;
+    return;
+  }
+
+  RCLCPP_WARN(get_logger(), "Mission sync required (%s), downloading full mission once", reason.c_str());
+
+  std::vector<MissionItem> items;
+  bool items_ok = false;
+  for (int attempt = 0; attempt < retries_ && !items_ok; ++attempt) {
+    items_ok = readMissionItems(count, items);
+  }
+
+  if (!items_ok) {
+    RCLCPP_WARN(get_logger(),
+      "Mission item download failed, not publishing cached mission to avoid replaying stale mission");
+    busy_ = false;
+    return;
+  }
+
+  sendAck();
+
+  const std::string json = buildJson(items, count, opaque_id);
+  const std::string hash = extractString(json, "hash");
+  const bool changed = !has_cache_ || hash != cached_hash_ || count != cached_count_ ||
+    (opaque_id != 0U && opaque_id != cached_opaque_id_);
+
+  if (changed || was_initial_sync) {
+    updateCache(json, count, opaque_id, hash);
+    publishAndSave(cached_json_);
+    if (changed) {
+      RCLCPP_INFO(get_logger(), "Mission JSON updated: count=%u opaque=%u hash=%s", count, opaque_id, hash.c_str());
+    } else {
+      RCLCPP_INFO(get_logger(), "Mission JSON verified and published once at startup: count=%u opaque=%u hash=%s",
+        count, opaque_id, hash.c_str());
+    }
+  } else {
+    last_full_download_ = now();
+    publishCachedMissionContinuously();
+    RCLCPP_INFO(get_logger(), "Mission sync completed but content unchanged: count=%u opaque=%u hash=%s",
+      count, opaque_id, cached_hash_.c_str());
+  }
+
+  force_download_ = false;
+  sync_reason_.clear();
+  busy_ = false;
+}
+
+void FcMissionReader::drainEvents(int timeout_ms)
+{
   const auto start = now();
-  while ((now() - start).nanoseconds() / 1000000 < read_budget_ms_) {
-    if (!readDatagram(1)) {
-      break;
+  while ((now() - start).nanoseconds() / 1000000 < timeout_ms) {
+    mavlink_message_t msg;
+    if (!readMessage(msg, 1)) {
+      return;
+    }
+  }
+}
+
+void FcMissionReader::observeMessage(const mavlink_message_t & msg)
+{
+  if (msg.sysid == own_sysid_) {
+    return;
+  }
+
+  if (msg.msgid == MAVLINK_MSG_ID_MISSION_CURRENT) {
+    mavlink_mission_current_t cur;
+    mavlink_msg_mission_current_decode(&msg, &cur);
+    target_sysid_ = msg.sysid;
+    target_compid_ = msg.compid;
+
+    remote_total_valid_ = true;
+
+    if (cur.total > 0U) {
+      mission_current_total_supported_ = true;
+      remote_total_ = cur.total;
+      remote_reported_empty_ = false;
+
+      if (has_cache_ && cur.total != cached_count_) {
+        RCLCPP_WARN(get_logger(), "Mission total changed from %u to %u", cached_count_, cur.total);
+        requestMissionSync("MISSION_CURRENT total changed");
+        return;
+      }
+    } else if (mission_current_total_supported_) {
+      remote_total_ = 0;
+      if (!remote_reported_empty_) {
+        RCLCPP_WARN(get_logger(), "FC reports no mission in MISSION_CURRENT total=0");
+      }
+      remote_reported_empty_ = true;
+      requestMissionSync("FC reports mission total=0");
+      return;
+    }
+
+    if (cur.mission_id != 0U) {
+      if (!remote_mission_id_valid_) {
+        remote_mission_id_valid_ = true;
+        remote_mission_id_ = cur.mission_id;
+        if (has_cache_ && cached_opaque_id_ != 0U && cached_opaque_id_ != cur.mission_id) {
+          requestMissionSync("MISSION_CURRENT mission_id differs from cache");
+        }
+        RCLCPP_INFO(get_logger(), "MissionCurrent mission_id=%u total=%u", cur.mission_id, cur.total);
+        return;
+      }
+
+      if (cur.mission_id != remote_mission_id_) {
+        RCLCPP_WARN(get_logger(), "Mission id changed: %u -> %u", remote_mission_id_, cur.mission_id);
+        remote_mission_id_ = cur.mission_id;
+        requestMissionSync("MISSION_CURRENT mission_id changed");
+      }
+    }
+    return;
+  }
+
+  if (msg.msgid == MAVLINK_MSG_ID_MISSION_ACK) {
+    mavlink_mission_ack_t ack;
+    mavlink_msg_mission_ack_decode(&msg, &ack);
+    if (ack.mission_type == mission_type_ && ack.type == MAV_MISSION_ACCEPTED) {
+      if (ack.opaque_id != 0U) {
+        if (!remote_mission_id_valid_ || ack.opaque_id != remote_mission_id_) {
+          RCLCPP_WARN(get_logger(), "Mission ACK accepted with new opaque_id=%u", ack.opaque_id);
+          remote_mission_id_valid_ = true;
+          remote_mission_id_ = ack.opaque_id;
+          requestMissionSync("MISSION_ACK opaque_id changed");
+        }
+      } else {
+        requestMissionSync("MISSION_ACK accepted without opaque_id");
+      }
+    }
+  }
+}
+
+void FcMissionReader::requestMissionSync(const std::string & reason)
+{
+  force_download_ = true;
+  if (sync_reason_.empty() || sync_reason_ == "startup") {
+    sync_reason_ = reason;
+  }
+}
+
+void FcMissionReader::handleEmptyMission(uint32_t opaque_id, const std::string & reason, bool publish_even_if_unchanged)
+{
+  std::vector<MissionItem> items;
+  const std::string json = buildJson(items, 0, opaque_id);
+  const std::string hash = extractString(json, "hash");
+  const bool changed = !has_cache_ || cached_count_ != 0U || cached_hash_ != hash ||
+    (opaque_id != 0U && cached_opaque_id_ != opaque_id);
+
+  updateCache(json, 0, opaque_id, hash);
+  if (opaque_id == 0U) {
+    remote_mission_id_valid_ = false;
+    remote_mission_id_ = 0;
+  }
+
+  if (changed || publish_even_if_unchanged) {
+    publishAndSave(cached_json_);
+    if (changed) {
+      RCLCPP_WARN(get_logger(), "Mission JSON cleared because FC has no mission. reason=%s opaque=%u hash=%s",
+        reason.c_str(), opaque_id, hash.c_str());
+    } else {
+      RCLCPP_INFO(get_logger(), "Empty mission JSON verified and published once at startup");
+    }
+  } else {
+    last_full_download_ = now();
+    RCLCPP_DEBUG(get_logger(), "FC still has no mission, empty JSON unchanged");
+  }
+}
+
+bool FcMissionReader::missionIdChanged() const
+{
+  return remote_mission_id_valid_ && cached_opaque_id_ != 0U && remote_mission_id_ != cached_opaque_id_;
+}
+
+bool FcMissionReader::readMissionInfo(uint16_t & count, uint32_t & opaque_id)
+{
+  if (readMissionInfoFromCurrentEndpoint(count, opaque_id)) {
+    return true;
+  }
+
+  // Khi auto_target=false, người dùng có thể cấu hình nhầm target_port là cổng telemetry
+  // của GCS/router. Trường hợp này node vẫn nhìn thấy MISSION_CURRENT nhưng FC không nhận
+  // được MISSION_REQUEST_LIST. Nếu đã quan sát được peer đang gửi MAVLink vào bind_port,
+  // thử gửi request ngược về đúng peer đó một lần để tự phục hồi.
+  if (!auto_target_ && has_observed_peer_ && !prefer_observed_peer_for_requests_) {
+    RCLCPP_WARN(get_logger(),
+      "MISSION_COUNT not received from manual target %s:%d. Retrying via observed MAVLink peer %s",
+      target_ip_.c_str(), target_port_, addrText(observed_peer_addr_).c_str());
+
+    prefer_observed_peer_for_requests_ = true;
+    const bool ok = readMissionInfoFromCurrentEndpoint(count, opaque_id);
+    if (ok) {
+      RCLCPP_WARN(get_logger(),
+        "Mission requests will keep using observed MAVLink peer %s. Manual target was probably not the FC input port.",
+        addrText(observed_peer_addr_).c_str());
+      return true;
+    }
+
+    prefer_observed_peer_for_requests_ = false;
+  }
+
+  return false;
+}
+
+bool FcMissionReader::readMissionInfoFromCurrentEndpoint(uint16_t & count, uint32_t & opaque_id)
+{
+  if (!waitHeartbeat()) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+      "No MAVLink heartbeat. Using target sys=%u comp=%u", target_sysid_, target_compid_);
+  }
+
+  for (int attempt = 0; attempt < retries_; ++attempt) {
+    sendRequestList();
+    if (waitCount(count, opaque_id)) {
+      return true;
     }
   }
 
-  checkTransferTimeout();
-  startup_phase_ = false;
+  return false;
 }
 
-bool FcMissionReader::readDatagram(int timeout_ms)
+bool FcMissionReader::readMissionItems(uint16_t count, std::vector<MissionItem> & items)
+{
+  items.clear();
+  items.resize(count);
+
+  for (uint16_t seq = 0; seq < count; ++seq) {
+    MissionItem item;
+    bool got = false;
+    for (int retry = 0; retry < retries_ && !got; ++retry) {
+      sendRequestItem(seq);
+      got = waitItem(seq, item);
+    }
+
+    if (!got) {
+      RCLCPP_WARN(get_logger(), "Missing mission item seq=%u", seq);
+      return false;
+    }
+
+    items[seq] = item;
+  }
+
+  return true;
+}
+
+bool FcMissionReader::readMission(std::vector<MissionItem> & items, uint16_t & count, uint32_t & opaque_id)
+{
+  if (!readMissionInfo(count, opaque_id)) {
+    return false;
+  }
+
+  if (!readMissionItems(count, items)) {
+    return false;
+  }
+
+  sendAck();
+  return true;
+}
+
+bool FcMissionReader::waitHeartbeat()
+{
+  const auto start = now();
+  while ((now() - start).seconds() < 1.0) {
+    mavlink_message_t msg;
+    if (!readMessage(msg, 200)) {
+      continue;
+    }
+
+    if (msg.msgid == MAVLINK_MSG_ID_HEARTBEAT) {
+      mavlink_heartbeat_t hb;
+      mavlink_msg_heartbeat_decode(&msg, &hb);
+      if (hb.type != MAV_TYPE_GCS) {
+        target_sysid_ = msg.sysid;
+        target_compid_ = msg.compid;
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+bool FcMissionReader::waitCount(uint16_t & count, uint32_t & opaque_id)
+{
+  const auto start = now();
+  while ((now() - start).nanoseconds() / 1000000 < timeout_ms_) {
+    mavlink_message_t msg;
+    if (!readMessage(msg, 200)) {
+      continue;
+    }
+
+    if (msg.msgid == MAVLINK_MSG_ID_MISSION_COUNT) {
+      mavlink_mission_count_t c;
+      mavlink_msg_mission_count_decode(&msg, &c);
+      if (c.mission_type == mission_type_) {
+        count = c.count;
+        opaque_id = c.opaque_id;
+        target_sysid_ = msg.sysid;
+        target_compid_ = msg.compid;
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+bool FcMissionReader::waitItem(uint16_t seq, MissionItem & item)
+{
+  const auto start = now();
+  while ((now() - start).nanoseconds() / 1000000 < timeout_ms_) {
+    mavlink_message_t msg;
+    if (!readMessage(msg, 200)) {
+      continue;
+    }
+
+    if (msg.msgid == MAVLINK_MSG_ID_MISSION_ITEM_INT) {
+      mavlink_mission_item_int_t it;
+      mavlink_msg_mission_item_int_decode(&msg, &it);
+      if (it.seq != seq || it.mission_type != mission_type_) {
+        continue;
+      }
+
+      item.ok = true;
+      item.is_int = true;
+      item.seq = it.seq;
+      item.frame = it.frame;
+      item.command = it.command;
+      item.current = it.current;
+      item.autocontinue = it.autocontinue;
+      item.mission_type = it.mission_type;
+      item.p1 = it.param1;
+      item.p2 = it.param2;
+      item.p3 = it.param3;
+      item.p4 = it.param4;
+      item.x = static_cast<double>(it.x) / 1.0e7;
+      item.y = static_cast<double>(it.y) / 1.0e7;
+      item.z = it.z;
+      return true;
+    }
+
+    if (msg.msgid == MAVLINK_MSG_ID_MISSION_ITEM) {
+      mavlink_mission_item_t it;
+      mavlink_msg_mission_item_decode(&msg, &it);
+      if (it.seq != seq || it.mission_type != mission_type_) {
+        continue;
+      }
+
+      item.ok = true;
+      item.is_int = false;
+      item.seq = it.seq;
+      item.frame = it.frame;
+      item.command = it.command;
+      item.current = it.current;
+      item.autocontinue = it.autocontinue;
+      item.mission_type = it.mission_type;
+      item.p1 = it.param1;
+      item.p2 = it.param2;
+      item.p3 = it.param3;
+      item.p4 = it.param4;
+      item.x = it.x;
+      item.y = it.y;
+      item.z = it.z;
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool FcMissionReader::readMessage(mavlink_message_t & msg, int timeout_ms)
 {
   fd_set fds;
   FD_ZERO(&fds);
@@ -126,7 +545,7 @@ bool FcMissionReader::readDatagram(int timeout_ms)
     return false;
   }
 
-  uint8_t buffer[4096];
+  uint8_t buffer[2048];
   sockaddr_in src{};
   socklen_t src_len = sizeof(src);
   const ssize_t len = recvfrom(sock_, buffer, sizeof(buffer), 0,
@@ -135,564 +554,172 @@ bool FcMissionReader::readDatagram(int timeout_ms)
     return false;
   }
 
-  mavlink_message_t msg{};
   mavlink_status_t status{};
-  bool parsed_any = false;
   for (ssize_t i = 0; i < len; ++i) {
     if (mavlink_parse_char(MAVLINK_COMM_0, buffer[i], &msg, &status)) {
-      parsed_any = true;
-      observeMessage(msg, src);
+      rememberSender(src, msg);
+      observeMessage(msg);
+      return true;
     }
   }
 
-  return parsed_any;
+  return false;
 }
 
-void FcMissionReader::observeMessage(const mavlink_message_t & msg, const sockaddr_in & src)
-{
-  (void)src;
-
-  if (msg.sysid == own_sysid_) {
-    return;
-  }
-
-  switch (msg.msgid) {
-    case MAVLINK_MSG_ID_HEARTBEAT:
-      handleHeartbeat(msg);
-      break;
-    case MAVLINK_MSG_ID_MISSION_CURRENT:
-      handleMissionCurrent(msg);
-      break;
-    case MAVLINK_MSG_ID_MISSION_COUNT:
-      handleMissionCount(msg);
-      break;
-    case MAVLINK_MSG_ID_MISSION_ITEM_INT:
-      handleMissionItemInt(msg);
-      break;
-    case MAVLINK_MSG_ID_MISSION_ITEM:
-      handleMissionItem(msg);
-      break;
-    case MAVLINK_MSG_ID_MISSION_CLEAR_ALL:
-      handleMissionClearAll(msg);
-      break;
-    case MAVLINK_MSG_ID_MISSION_ACK:
-      handleMissionAck(msg);
-      break;
-    default:
-      break;
-  }
-}
-
-bool FcMissionReader::isFlightControllerHeartbeat(
-  const mavlink_message_t & msg, mavlink_heartbeat_t & heartbeat) const
-{
-  if (msg.msgid != MAVLINK_MSG_ID_HEARTBEAT) {
-    return false;
-  }
-
-  mavlink_msg_heartbeat_decode(&msg, &heartbeat);
-  if (heartbeat.type == MAV_TYPE_GCS) {
-    return false;
-  }
-  if (heartbeat.autopilot == MAV_AUTOPILOT_INVALID) {
-    return false;
-  }
-  return true;
-}
-
-bool FcMissionReader::isTargetFlightControllerMessage(const mavlink_message_t & msg) const
+void FcMissionReader::rememberSender(const sockaddr_in & src, const mavlink_message_t & msg)
 {
   if (msg.sysid == own_sysid_) {
-    return false;
-  }
-
-  if (has_fc_heartbeat_) {
-    return msg.sysid == target_sysid_;
-  }
-
-  return msg.sysid == target_sysid_;
-}
-
-bool FcMissionReader::isDirectedToFlightController(uint8_t target_system, uint8_t target_component) const
-{
-  if (target_system != target_sysid_ && target_system != 0U) {
-    return false;
-  }
-
-  return target_component == target_compid_ || target_component == 0U;
-}
-
-bool FcMissionReader::isDirectedFromFlightController(const mavlink_message_t & msg) const
-{
-  return isTargetFlightControllerMessage(msg);
-}
-
-bool FcMissionReader::missionTypeMatches(uint8_t mission_type) const
-{
-  return mission_type == mission_type_ || mission_type == MAV_MISSION_TYPE_MISSION;
-}
-
-void FcMissionReader::handleHeartbeat(const mavlink_message_t & msg)
-{
-  mavlink_heartbeat_t hb{};
-  if (!isFlightControllerHeartbeat(msg, hb)) {
     return;
   }
 
-  const bool changed = !has_fc_heartbeat_ || target_sysid_ != msg.sysid || target_compid_ != msg.compid;
-  target_sysid_ = msg.sysid;
-  target_compid_ = msg.compid;
-  has_fc_heartbeat_ = true;
-  last_fc_heartbeat_ = now();
-
-  if (changed) {
-    RCLCPP_INFO(get_logger(),
-      "Locked FC target from HEARTBEAT: sys=%u comp=%u type=%u autopilot=%u",
-      target_sysid_, target_compid_, hb.type, hb.autopilot);
-  }
-}
-
-void FcMissionReader::handleMissionCurrent(const mavlink_message_t & msg)
-{
-  if (!isTargetFlightControllerMessage(msg)) {
-    return;
-  }
-
-  mavlink_mission_current_t cur{};
-  mavlink_msg_mission_current_decode(&msg, &cur);
-
-  const bool had_remote_id = remote_mission_id_valid_;
-  const uint32_t old_remote_id = remote_mission_id_;
-  const bool had_total = remote_total_valid_;
-  const uint16_t old_total = remote_total_;
-
-  if (cur.total > 0U) {
-    mission_current_total_supported_ = true;
-    remote_total_valid_ = true;
-    remote_total_ = cur.total;
-  } else if (mission_current_total_supported_) {
-    remote_total_valid_ = true;
-    remote_total_ = 0U;
-  }
-
-  if (cur.mission_id != 0U) {
-    remote_mission_id_valid_ = true;
-    remote_mission_id_ = cur.mission_id;
-  }
-
-  if (transfer_.active || pending_clear_) {
-    // Mission metadata may change while another client is uploading/clearing.
-    // Wait until the observed transaction finishes, then publish one final JSON.
-    return;
-  }
-
-  if (mission_current_total_supported_ && cur.total == 0U && publish_empty_from_mission_current_) {
-    handleRemoteEmpty("FC MISSION_CURRENT total=0", !startup_phase_ || publish_reset_on_startup_change_);
-    return;
-  }
-
-  const bool id_changed = had_remote_id && cur.mission_id != 0U && cur.mission_id != old_remote_id;
-  const bool total_changed = had_total && cur.total > 0U && cur.total != old_total;
-  const bool cache_id_mismatch = cur.mission_id != 0U && cached_opaque_id_ != 0U && cur.mission_id != cached_opaque_id_;
-  const bool cache_count_mismatch = cur.total > 0U && has_cache_ && cached_count_ != cur.total;
-
-  if ((id_changed || total_changed || cache_id_mismatch || cache_count_mismatch) && publish_unknown_on_remote_change_) {
-    handleUnknownRemoteMission(
-      "FC reports mission metadata changed, but passive observer has not seen full mission transfer yet",
-      !startup_phase_ || publish_reset_on_startup_change_);
-  }
-}
-
-void FcMissionReader::handleMissionCount(const mavlink_message_t & msg)
-{
-  mavlink_mission_count_t count{};
-  mavlink_msg_mission_count_decode(&msg, &count);
-  if (!missionTypeMatches(count.mission_type)) {
-    return;
-  }
-
-  if (msg.sysid != target_sysid_ && isDirectedToFlightController(count.target_system, count.target_component)) {
-    beginTransfer(true, msg.sysid, msg.compid, count.count, count.opaque_id, "observed mission upload count");
-    return;
-  }
-
-  if (isDirectedFromFlightController(msg)) {
-    beginTransfer(false, count.target_system, count.target_component, count.count, count.opaque_id,
-      "observed mission download count from FC");
-  }
-}
-
-void FcMissionReader::handleMissionItemInt(const mavlink_message_t & msg)
-{
-  mavlink_mission_item_int_t it{};
-  mavlink_msg_mission_item_int_decode(&msg, &it);
-  if (!missionTypeMatches(it.mission_type)) {
-    return;
-  }
-
-  MissionItem item{};
-  item.ok = true;
-  item.is_int = true;
-  item.seq = it.seq;
-  item.frame = it.frame;
-  item.command = it.command;
-  item.current = it.current;
-  item.autocontinue = it.autocontinue;
-  item.mission_type = it.mission_type;
-  item.p1 = it.param1;
-  item.p2 = it.param2;
-  item.p3 = it.param3;
-  item.p4 = it.param4;
-  item.x = static_cast<double>(it.x) / 1.0e7;
-  item.y = static_cast<double>(it.y) / 1.0e7;
-  item.z = it.z;
-
-  captureMissionItem(item, msg);
-}
-
-void FcMissionReader::handleMissionItem(const mavlink_message_t & msg)
-{
-  mavlink_mission_item_t it{};
-  mavlink_msg_mission_item_decode(&msg, &it);
-  if (!missionTypeMatches(it.mission_type)) {
-    return;
-  }
-
-  MissionItem item{};
-  item.ok = true;
-  item.is_int = false;
-  item.seq = it.seq;
-  item.frame = it.frame;
-  item.command = it.command;
-  item.current = it.current;
-  item.autocontinue = it.autocontinue;
-  item.mission_type = it.mission_type;
-  item.p1 = it.param1;
-  item.p2 = it.param2;
-  item.p3 = it.param3;
-  item.p4 = it.param4;
-  item.x = it.x;
-  item.y = it.y;
-  item.z = it.z;
-
-  captureMissionItem(item, msg);
-}
-
-void FcMissionReader::handleMissionClearAll(const mavlink_message_t & msg)
-{
-  mavlink_mission_clear_all_t clear{};
-  mavlink_msg_mission_clear_all_decode(&msg, &clear);
-  if (!missionTypeMatches(clear.mission_type)) {
-    return;
-  }
-
-  if (msg.sysid != target_sysid_ && isDirectedToFlightController(clear.target_system, clear.target_component)) {
-    markPendingClear(msg, "observed MISSION_CLEAR_ALL to FC");
-  }
-}
-
-void FcMissionReader::handleMissionAck(const mavlink_message_t & msg)
-{
-  mavlink_mission_ack_t ack{};
-  mavlink_msg_mission_ack_decode(&msg, &ack);
-  if (!missionTypeMatches(ack.mission_type)) {
-    return;
-  }
-
-  if (isTargetFlightControllerMessage(msg)) {
-    if (ack.type != MAV_MISSION_ACCEPTED) {
+  if (msg.msgid == MAVLINK_MSG_ID_HEARTBEAT) {
+    mavlink_heartbeat_t hb;
+    mavlink_msg_heartbeat_decode(&msg, &hb);
+    if (hb.type == MAV_TYPE_GCS) {
       return;
     }
+  }
 
-    if (pending_clear_) {
-      const bool target_matches_peer = ack.target_system == pending_clear_peer_sysid_ || ack.target_system == 0U;
-      if (target_matches_peer) {
-        finalizeClear(ack.opaque_id, "FC accepted observed mission clear");
+  if (!has_observed_peer_ || src.sin_addr.s_addr != observed_peer_addr_.sin_addr.s_addr ||
+    src.sin_port != observed_peer_addr_.sin_port)
+  {
+    observed_peer_addr_ = src;
+    has_observed_peer_ = true;
+    RCLCPP_INFO(get_logger(), "Observed MAVLink peer %s from msgid=%u sys=%u comp=%u",
+      addrText(observed_peer_addr_).c_str(), msg.msgid, msg.sysid, msg.compid);
+  }
+
+  if (!auto_target_) {
+    return;
+  }
+
+  if (!has_learned_target_ || src.sin_addr.s_addr != learned_addr_.sin_addr.s_addr ||
+    src.sin_port != learned_addr_.sin_port)
+  {
+    learned_addr_ = src;
+    has_learned_target_ = true;
+    RCLCPP_INFO(get_logger(), "Learned MAVLink peer %s from msgid=%u sys=%u comp=%u",
+      addrText(learned_addr_).c_str(), msg.msgid, msg.sysid, msg.compid);
+  }
+}
+
+std::string FcMissionReader::addrText(const sockaddr_in & addr) const
+{
+  char ip[INET_ADDRSTRLEN]{};
+  inet_ntop(AF_INET, &addr.sin_addr, ip, sizeof(ip));
+  std::ostringstream ss;
+  ss << ip << ":" << ntohs(addr.sin_port);
+  return ss.str();
+}
+
+void FcMissionReader::sendMessage(const mavlink_message_t & msg)
+{
+  uint8_t buffer[MAVLINK_MAX_PACKET_LEN];
+  const uint16_t len = mavlink_msg_to_send_buffer(buffer, &msg);
+
+  // Gửi request tới tất cả endpoint MAVLink hợp lệ đã biết.
+  // Lý do: trong mô hình mavlink-router/QGC/PX4, port nhận telemetry và port nhận command
+  // có thể khác nhau. Nếu cấu hình manual target sai, node vẫn tự phục hồi bằng observed peer.
+  // Trường hợp target_port == bind_port trên loopback được bỏ qua để tránh tự gửi request vào chính node.
+  auto is_loopback = [](const sockaddr_in & addr) -> bool {
+    return (ntohl(addr.sin_addr.s_addr) >> 24) == 127U;
+  };
+
+  auto same_endpoint = [](const sockaddr_in & a, const sockaddr_in & b) -> bool {
+    return a.sin_addr.s_addr == b.sin_addr.s_addr && a.sin_port == b.sin_port;
+  };
+
+  auto target_is_self = [&]() -> bool {
+    return ntohs(target_addr_.sin_port) == static_cast<uint16_t>(bind_port_) &&
+      (is_loopback(target_addr_) || target_ip_ == "0.0.0.0");
+  };
+
+  std::vector<sockaddr_in> destinations;
+  auto add_destination = [&](const sockaddr_in & addr) {
+    for (const auto & existing : destinations) {
+      if (same_endpoint(existing, addr)) {
         return;
       }
     }
+    destinations.push_back(addr);
+  };
 
-    if (transfer_.active && transfer_.upload_to_fc) {
-      if (ack.opaque_id != 0U) {
-        transfer_.opaque_id = ack.opaque_id;
-      }
-      finalizeTransfer("FC accepted observed mission upload", true);
-    }
-    return;
+  if (auto_target_ && has_learned_target_) {
+    add_destination(learned_addr_);
   }
 
-  if (transfer_.active && !transfer_.upload_to_fc && transferComplete()) {
-    finalizeTransfer("observed mission download completed", false);
-  }
-}
-
-void FcMissionReader::beginTransfer(
-  bool upload_to_fc,
-  uint8_t peer_sysid,
-  uint8_t peer_compid,
-  uint16_t expected_count,
-  uint32_t opaque_id,
-  const std::string & reason)
-{
-  if (expected_count == 0U) {
-    if (upload_to_fc) {
-      handleRemoteEmpty("observed upload count=0", true);
-    }
-    return;
+  if (has_observed_peer_ && (prefer_observed_peer_for_requests_ || !auto_target_ || target_is_self())) {
+    add_destination(observed_peer_addr_);
   }
 
-  transfer_ = PassiveTransfer{};
-  transfer_.active = true;
-  transfer_.upload_to_fc = upload_to_fc;
-  transfer_.peer_sysid = peer_sysid;
-  transfer_.peer_compid = peer_compid;
-  transfer_.expected_count = expected_count;
-  transfer_.opaque_id = opaque_id;
-  transfer_.mission_type = mission_type_;
-  transfer_.items.resize(expected_count);
-  transfer_.last_update = now();
-  transfer_.reason = reason;
-
-  RCLCPP_INFO(get_logger(), "%s: direction=%s peer=%u/%u count=%u opaque=%u",
-    reason.c_str(), upload_to_fc ? "upload_to_fc" : "download_from_fc",
-    peer_sysid, peer_compid, expected_count, opaque_id);
-}
-
-void FcMissionReader::resetTransfer(const std::string & reason)
-{
-  if (transfer_.active) {
-    RCLCPP_DEBUG(get_logger(), "Reset passive mission transfer. reason=%s", reason.c_str());
-  }
-  transfer_ = PassiveTransfer{};
-}
-
-bool FcMissionReader::transferMatches(const PassiveTransfer & transfer, const mavlink_message_t & msg) const
-{
-  if (!transfer.active) {
-    return false;
-  }
-
-  if (transfer.upload_to_fc) {
-    return msg.sysid == transfer.peer_sysid && msg.compid == transfer.peer_compid;
-  }
-
-  return isTargetFlightControllerMessage(msg);
-}
-
-void FcMissionReader::captureMissionItem(const MissionItem & item, const mavlink_message_t & msg)
-{
-  if (!transferMatches(transfer_, msg)) {
-    return;
-  }
-
-  if (item.seq >= transfer_.items.size()) {
-    return;
-  }
-
-  transfer_.items[item.seq] = item;
-  transfer_.last_update = now();
-
-  if (!transfer_.upload_to_fc && transferComplete()) {
-    finalizeTransfer("observed all mission items during download", false);
-  }
-}
-
-bool FcMissionReader::transferComplete() const
-{
-  if (!transfer_.active || transfer_.items.size() != transfer_.expected_count) {
-    return false;
-  }
-
-  for (const auto & item : transfer_.items) {
-    if (!item || !item->ok) {
-      return false;
-    }
-  }
-  return true;
-}
-
-std::vector<MissionItem> FcMissionReader::completedTransferItems() const
-{
-  std::vector<MissionItem> items;
-  if (!transferComplete()) {
-    return items;
-  }
-
-  items.reserve(transfer_.items.size());
-  for (const auto & item : transfer_.items) {
-    items.push_back(*item);
-  }
-  return items;
-}
-
-void FcMissionReader::finalizeTransfer(const std::string & reason, bool allow_reset)
-{
-  if (!transfer_.active) {
-    return;
-  }
-
-  if (!transferComplete()) {
-    RCLCPP_WARN(get_logger(),
-      "Cannot finalize passive mission transfer because not all items were observed. reason=%s count=%u",
-      reason.c_str(), transfer_.expected_count);
-    resetTransfer("incomplete finalize");
-    handleUnknownRemoteMission("observed mission transfer completed but item stream was incomplete", allow_reset);
-    return;
-  }
-
-  const auto items = completedTransferItems();
-  const uint32_t opaque_id = transfer_.opaque_id;
-  const uint16_t count = transfer_.expected_count;
-  const std::string json = buildJson(items, count, opaque_id, "ready", reason);
-  const std::string hash = extractString(json, "hash");
-  const std::string signature = "mission:" + hash;
-  const bool changed = !has_cache_ || cached_hash_ != hash || cached_count_ != count ||
-    (opaque_id != 0U && cached_opaque_id_ != opaque_id) || cached_status_ != "ready";
-
-  updateCache(json, count, opaque_id, hash, "ready");
-  if (opaque_id != 0U) {
-    remote_mission_id_valid_ = true;
-    remote_mission_id_ = opaque_id;
-  }
-  remote_total_valid_ = true;
-  remote_total_ = count;
-
-  if (changed) {
-    publishResetIfNeeded(reason, signature, allow_reset && (!startup_phase_ || publish_reset_on_startup_change_));
-    publishJsonIfChanged(json, signature, reason);
-    saveJson(json);
-    RCLCPP_WARN(get_logger(), "Passive mission JSON updated: count=%u opaque=%u hash=%s reason=%s",
-      count, opaque_id, hash.c_str(), reason.c_str());
+  if (!target_is_self()) {
+    add_destination(target_addr_);
   } else {
-    RCLCPP_INFO(get_logger(), "Passive mission transfer observed but JSON unchanged: count=%u hash=%s reason=%s",
-      count, hash.c_str(), reason.c_str());
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+      "Manual target %s:%d equals local bind port. Skipping self-loop target and using observed MAVLink peer if available.",
+      target_ip_.c_str(), target_port_);
   }
 
-  resetTransfer("finalized transfer");
-}
-
-void FcMissionReader::checkTransferTimeout()
-{
-  if (transfer_.active && transfer_.last_update.nanoseconds() != 0 &&
-    (now() - transfer_.last_update).seconds() > transfer_timeout_s_)
-  {
-    RCLCPP_WARN(get_logger(), "Passive mission transfer timed out before all items were observed. reason=%s",
-      transfer_.reason.c_str());
-    resetTransfer("transfer timeout");
+  if (destinations.empty() && has_observed_peer_) {
+    add_destination(observed_peer_addr_);
   }
 
-  if (pending_clear_ && pending_clear_time_.nanoseconds() != 0 &&
-    (now() - pending_clear_time_).seconds() > transfer_timeout_s_)
-  {
-    RCLCPP_WARN(get_logger(), "Observed MISSION_CLEAR_ALL but no accepted ACK before timeout");
-    pending_clear_ = false;
+  for (const auto & dst : destinations) {
+    sendto(sock_, buffer, len, 0, reinterpret_cast<const sockaddr *>(&dst), sizeof(dst));
   }
 }
 
-void FcMissionReader::markPendingClear(const mavlink_message_t & msg, const std::string & reason)
+void FcMissionReader::sendRequestList()
 {
-  pending_clear_ = true;
-  pending_clear_peer_sysid_ = msg.sysid;
-  pending_clear_peer_compid_ = msg.compid;
-  pending_clear_time_ = now();
-  resetTransfer("clear command observed");
-  RCLCPP_WARN(get_logger(), "%s from peer=%u/%u; waiting FC MISSION_ACK ACCEPTED",
-    reason.c_str(), msg.sysid, msg.compid);
+  mavlink_message_t msg;
+  mavlink_msg_mission_request_list_pack(
+    own_sysid_, own_compid_, &msg, target_sysid_, target_compid_, mission_type_);
+  sendMessage(msg);
 }
 
-void FcMissionReader::finalizeClear(uint32_t opaque_id, const std::string & reason)
+void FcMissionReader::sendRequestItem(uint16_t seq)
 {
-  pending_clear_ = false;
-  handleRemoteEmpty(reason, true);
-  if (opaque_id != 0U) {
-    remote_mission_id_valid_ = true;
-    remote_mission_id_ = opaque_id;
-  }
+  mavlink_message_t msg;
+  mavlink_msg_mission_request_int_pack(
+    own_sysid_, own_compid_, &msg, target_sysid_, target_compid_, seq, mission_type_);
+  sendMessage(msg);
 }
 
-void FcMissionReader::handleRemoteEmpty(const std::string & reason, bool allow_reset)
+void FcMissionReader::sendAck()
 {
-  std::vector<MissionItem> items;
-  const uint32_t opaque_id = remote_mission_id_valid_ ? remote_mission_id_ : 0U;
-  const std::string json = buildJson(items, 0, opaque_id, "empty", reason);
-  const std::string hash = extractString(json, "hash");
-  const std::string signature = "empty:" + hash + ":" + std::to_string(opaque_id);
-  const bool changed = !has_cache_ || cached_count_ != 0U || cached_status_ != "empty" || cached_hash_ != hash ||
-    (opaque_id != 0U && cached_opaque_id_ != opaque_id);
-
-  updateCache(json, 0, opaque_id, hash, "empty");
-  remote_total_valid_ = true;
-  remote_total_ = 0U;
-
-  if (changed) {
-    publishResetIfNeeded(reason, signature, allow_reset);
-    publishJsonIfChanged(json, signature, reason);
-    saveJson(json);
-    RCLCPP_WARN(get_logger(), "Passive mission JSON cleared: reason=%s opaque=%u", reason.c_str(), opaque_id);
-  }
-}
-
-void FcMissionReader::handleUnknownRemoteMission(const std::string & reason, bool allow_reset)
-{
-  if (!publish_unknown_on_remote_change_) {
-    return;
-  }
-
-  std::vector<MissionItem> items;
-  const uint16_t count = remote_total_valid_ ? remote_total_ : 0U;
-  const uint32_t opaque_id = remote_mission_id_valid_ ? remote_mission_id_ : 0U;
-  const std::string json = buildJson(items, count, opaque_id, "unknown_remote_mission", reason);
-  const std::string hash = extractString(json, "hash");
-  const std::string signature = "unknown:" + std::to_string(count) + ":" + std::to_string(opaque_id);
-  const bool changed = !has_cache_ || cached_status_ != "unknown_remote_mission" || cached_count_ != count ||
-    cached_opaque_id_ != opaque_id;
-
-  updateCache(json, count, opaque_id, hash, "unknown_remote_mission");
-
-  if (changed) {
-    publishResetIfNeeded(reason, signature, allow_reset);
-    publishJsonIfChanged(json, signature, reason);
-    saveJson(json);
-    RCLCPP_WARN(get_logger(),
-      "Remote mission became UNKNOWN for passive observer: count=%u opaque=%u reason=%s. Old mission cache was overwritten to avoid stale replay.",
-      count, opaque_id, reason.c_str());
-  }
+  mavlink_message_t msg;
+  mavlink_msg_mission_ack_pack(
+    own_sysid_, own_compid_, &msg, target_sysid_, target_compid_, MAV_MISSION_ACCEPTED,
+    mission_type_, 0);
+  sendMessage(msg);
 }
 
 std::string FcMissionReader::buildJson(
-  const std::vector<MissionItem> & items,
-  uint16_t count,
-  uint32_t opaque_id,
-  const std::string & status,
-  const std::string & note) const
+  const std::vector<MissionItem> & items, uint16_t count, uint32_t opaque_id) const
 {
   const std::string custom = buildCustomMission(items);
   const std::string raw = buildRawItems(items);
-  const std::string hash = hashText(status + ":" + raw + ":" + std::to_string(count));
-  const bool ok = (status == "ready" || status == "empty");
+  const std::string hash = hashText(raw);
 
   std::ostringstream ss;
-  ss << "{\"ok\":" << (ok ? "true" : "false")
-     << ",\"source\":\"mavlink_passive_observer\""
-     << ",\"status\":" << jsonString(status)
-     << ",\"note\":" << jsonString(note)
-     << ",\"item_count\":" << count
-     << ",\"observed_items\":" << items.size()
-     << ",\"remote_opaque_id\":" << opaque_id
-     << ",\"hash\":" << jsonString(hash)
-     << ",\"target\":{\"sysid\":" << static_cast<int>(target_sysid_)
-     << ",\"compid\":" << static_cast<int>(target_compid_) << "}"
-     << ",\"mission\":" << custom
-     << ",\"raw_items\":" << raw << "}";
+  ss << "{\"ok\":true,\"source\":\"mavlink_mission_protocol\","
+     << "\"item_count\":" << count << ","
+     << "\"downloaded_items\":" << items.size() << ","
+     << "\"remote_opaque_id\":" << opaque_id << ","
+     << "\"hash\":" << jsonString(hash) << ","
+     << "\"target\":{\"sysid\":" << static_cast<int>(target_sysid_)
+     << ",\"compid\":" << static_cast<int>(target_compid_) << "},"
+     << "\"mission\":" << custom << ","
+     << "\"raw_items\":" << raw << "}";
   return ss.str();
 }
 
 std::string FcMissionReader::buildCustomMission(const std::vector<MissionItem> & items) const
 {
   std::ostringstream ss;
-  ss << "{\"version\":1,\"mission\":{\"defaults\":{";
-  ss << "\"horizontalVelocity\":5.0,\"verticalVelocity\":2.0,\"maxHeadingRate\":60.0},";
-  ss << "\"items\":[";
+  ss << "{\"version\":1,\"mission\":{\"defaults\":{"
+     << "\"horizontalVelocity\":5.0,\"verticalVelocity\":2.0,\"maxHeadingRate\":60.0},"
+     << "\"items\":[";
 
   bool first = true;
   for (const auto & item : items) {
@@ -754,8 +781,8 @@ std::string FcMissionReader::convertItem(const MissionItem & item) const
       return ss.str();
 
     case MAV_CMD_NAV_WAYPOINT:
-      ss << "{\"type\":\"navigation\",\"navigationType\":\"waypoint\",";
-      ss << "\"frame\":\"global\",\"id\":" << jsonString(id)
+      ss << "{\"type\":\"navigation\",\"navigationType\":\"waypoint\","
+         << "\"frame\":\"global\",\"id\":" << jsonString(id)
          << ",\"x\":" << std::fixed << std::setprecision(7) << item.x
          << ",\"y\":" << std::fixed << std::setprecision(7) << item.y
          << ",\"z\":" << std::setprecision(3) << item.z << "}";
@@ -868,7 +895,6 @@ void FcMissionReader::loadCache()
   ss << file.rdbuf();
   cached_json_ = ss.str();
   cached_hash_ = extractString(cached_json_, "hash");
-  cached_status_ = extractString(cached_json_, "status");
 
   if (const auto n = extractNumber(cached_json_, "item_count")) {
     cached_count_ = static_cast<uint16_t>(*n);
@@ -879,80 +905,56 @@ void FcMissionReader::loadCache()
 
   has_cache_ = !cached_json_.empty() && !cached_hash_.empty();
   if (has_cache_) {
-    RCLCPP_INFO(get_logger(), "Loaded passive mission cache but will not publish it automatically: status=%s count=%u opaque=%u hash=%s",
-      cached_status_.c_str(), cached_count_, cached_opaque_id_, cached_hash_.c_str());
+    last_full_download_ = now();
+    RCLCPP_INFO(get_logger(), "Loaded mission cache: count=%u opaque=%u hash=%s",
+      cached_count_, cached_opaque_id_, cached_hash_.c_str());
   }
 }
 
 void FcMissionReader::updateCache(
-  const std::string & json,
-  uint16_t count,
-  uint32_t opaque_id,
-  const std::string & hash,
-  const std::string & status)
+  const std::string & json, uint16_t count, uint32_t opaque_id, const std::string & hash)
 {
   cached_json_ = json;
   cached_count_ = count;
   cached_opaque_id_ = opaque_id;
   cached_hash_ = hash;
-  cached_status_ = status;
   has_cache_ = true;
+  last_full_download_ = now();
 }
 
-void FcMissionReader::publishJsonIfChanged(
-  const std::string & json,
-  const std::string & signature,
-  const std::string & reason)
+void FcMissionReader::publishJson(const std::string & json)
 {
-  if (signature == last_published_signature_) {
-    RCLCPP_DEBUG(get_logger(), "mission_json publish suppressed because signature unchanged: %s", signature.c_str());
-    return;
-  }
-
   std_msgs::msg::String msg;
   msg.data = json;
   pub_->publish(msg);
-  last_published_signature_ = signature;
-  RCLCPP_INFO(get_logger(), "Published mission_json once. reason=%s signature=%s", reason.c_str(), signature.c_str());
 }
 
-void FcMissionReader::publishResetIfNeeded(
-  const std::string & reason,
-  const std::string & signature,
-  bool allow_reset)
+bool FcMissionReader::canPublishCachedMissionContinuously() const
 {
-  if (!publish_reset_on_mission_change_ || !reset_pub_) {
+  if (!publish_cached_mission_continuously_) {
+    return false;
+  }
+
+  if (!initial_sync_done_ || !has_cache_ || cached_json_.empty()) {
+    return false;
+  }
+
+  // Chỉ spam khi FC thật sự đang có mission. Không spam cache cũ trước khi sync,
+  // và không spam JSON rỗng để tránh adaptive/backend hiểu nhầm là có nhiệm vụ.
+  if (!remote_total_valid_ || remote_total_ == 0U || remote_reported_empty_) {
+    return false;
+  }
+
+  return cached_count_ > 0U;
+}
+
+void FcMissionReader::publishCachedMissionContinuously()
+{
+  if (!canPublishCachedMissionContinuously()) {
     return;
   }
 
-  if (!allow_reset) {
-    RCLCPP_INFO(get_logger(), "Reset event suppressed during startup/passive cache validation. reason=%s", reason.c_str());
-    return;
-  }
-
-  if (signature.empty() || last_reset_signature_ == signature) {
-    return;
-  }
-
-  const auto current_time = now();
-  if (last_reset_publish_.nanoseconds() != 0) {
-    const double dt = (current_time - last_reset_publish_).seconds();
-    if (dt < reset_publish_min_interval_s_) {
-      RCLCPP_WARN(get_logger(),
-        "Reset event suppressed %.3fs after previous reset to avoid reset spam. reason=%s",
-        dt, reason.c_str());
-      last_reset_signature_ = signature;
-      return;
-    }
-  }
-
-  std_msgs::msg::Bool reset_msg;
-  reset_msg.data = true;
-  reset_pub_->publish(reset_msg);
-  last_reset_signature_ = signature;
-  last_reset_publish_ = current_time;
-  RCLCPP_WARN(get_logger(), "Published adaptive mission reset event on %s. reason=%s signature=%s",
-    adaptive_reset_topic_.c_str(), reason.c_str(), signature.c_str());
+  publishJson(cached_json_);
 }
 
 void FcMissionReader::saveJson(const std::string & json)
@@ -967,6 +969,73 @@ void FcMissionReader::saveJson(const std::string & json)
   } catch (const std::exception & e) {
     RCLCPP_WARN(get_logger(), "Failed to write %s: %s", output_file_.c_str(), e.what());
   }
+}
+
+void FcMissionReader::publishAndSave(const std::string & json)
+{
+  publishJson(json);
+  saveJson(json);
+}
+
+void FcMissionReader::publishFailure(const std::string & note)
+{
+  std::ostringstream ss;
+  ss << "{\"ok\":false,\"source\":\"mavlink_mission_protocol\",";
+  ss << "\"note\":" << jsonString(note) << ",";
+  ss << "\"target\":{\"sysid\":" << static_cast<int>(target_sysid_)
+     << ",\"compid\":" << static_cast<int>(target_compid_) << "},";
+  ss << "\"mission\":{\"version\":1,\"mission\":{\"defaults\":{";
+  ss << "\"horizontalVelocity\":5.0,\"verticalVelocity\":2.0,\"maxHeadingRate\":60.0},";
+  ss << "\"items\":[]}}}";
+  publishJson(ss.str());
+}
+
+bool FcMissionReader::shouldDownload(uint16_t count, uint32_t opaque_id) const
+{
+  if (!has_cache_) {
+    return true;
+  }
+
+  if (count != cached_count_) {
+    return true;
+  }
+
+  if (opaque_id != 0U && cached_opaque_id_ != 0U) {
+    return opaque_id != cached_opaque_id_;
+  }
+
+  if (opaque_id != 0U && cached_opaque_id_ == 0U) {
+    return true;
+  }
+
+  return missionIdChanged();
+}
+
+bool FcMissionReader::shouldInitialDownload() const
+{
+  if (initial_sync_done_) {
+    return false;
+  }
+
+  if (last_count_poll_.nanoseconds() == 0) {
+    return true;
+  }
+
+  return (now() - last_count_poll_).seconds() >= fallback_count_poll_s_;
+}
+
+bool FcMissionReader::shouldPollMissionInfo() const
+{
+  if (!enable_fallback_count_poll_) {
+    return false;
+  }
+
+  if (!initial_sync_done_) {
+    return true;
+  }
+
+  return last_count_poll_.nanoseconds() == 0 ||
+    (now() - last_count_poll_).seconds() >= fallback_count_poll_s_;
 }
 
 std::string FcMissionReader::extractString(const std::string & json, const std::string & key) const
@@ -1033,5 +1102,6 @@ std::optional<uint64_t> FcMissionReader::extractNumber(const std::string & json,
   }
   return value;
 }
+
 
 }  // namespace fc_mission_reader

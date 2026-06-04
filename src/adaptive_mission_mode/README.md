@@ -1,93 +1,62 @@
 # adaptive_mission_mode
 
-ROS 2 / PX4 custom mission mode package.
+ROS 2/PX4 custom mission executor. Bản này đã clean lại theo hướng **một runtime FSM duy nhất** để tránh lỗi vá chồng vá.
 
-## Logic chính của bản này
+## Nguyên tắc vận hành
 
-Bản này dùng logic **external mode interruption resume**:
+- Callback ROS chỉ cập nhật dữ liệu hoặc event.
+- `mainLoop()` là nơi duy nhất quyết định state tiếp theo.
+- Command PX4 (`ARM`, `TAKEOFF`, `SET_MODE`, `POSCTL`) chỉ được gửi từ FSM trong `mainLoop()`.
+- Không dùng `nav_state_user_intention` để tự start/resume mission, vì field này có thể còn giữ mode cũ sau RTL/LAND.
+- Mission chỉ bị xóa khi:
+  - mission completed, hoặc
+  - publish `~/reset = true`.
+
+## Luồng chính
 
 ```text
-mission_json
-→ chỉ cache mission text
-→ chưa parse/chạy
+mission_json tới
+→ cache raw text
+→ chưa parse, chưa bay
 
-User chọn Adaptive Mission Mode
-→ parse mission cache
-→ set mission vào executor
-→ auto ARM/TAKEOFF nếu cần
-→ chạy mission
+user chọn Adaptive Mission Mode
+→ parse/cache mission
+→ setMission vào executor
+→ nếu cần thì ARM + MAV_CMD_NAV_TAKEOFF
+→ SET_MODE Adaptive
+→ RUNNING
 
-Trong khi đang bay
-→ main loop lưu snapshot liên tục: lat/lon/alt/current_index/altitude_offset
+đang RUNNING mà user chọn mode khác / RTL / LAND
+→ lưu snapshot cuối cùng
+→ giữ mission cũ trong executor
+→ state = external_interrupted_wait_selection
 
-User chọn mode khác bất ngờ, ví dụ POSCTL/ALTCTL/RTL/LAND
-→ onDeactivated chỉ đánh dấu externalInterrupted
-→ KHÔNG xóa mission
-→ KHÔNG build resume mission
-→ KHÔNG setMission lại
-
-User chọn lại Adaptive Mission Mode
-→ dùng mission cũ còn trong bộ nhớ
-→ nếu cần thì ARM/TAKEOFF lại đến altitude snapshot
+user chọn Adaptive lại
+→ nếu cần thì takeoff tới altitude snapshot
+→ vào Adaptive Mode
 → bay về snapshot
-→ return_to_snapshot xong thì unblock executor
-→ executor tiếp tục mission cũ
+→ tới snapshot thì unblock executor
+→ mission cũ chạy tiếp
 
-Mission chỉ bị xóa khi:
-→ mission completed
-→ hoặc nhận topic /adaptive_mission_mode/reset
+mission completed hoặc ~/reset
+→ clear cache/runtime/snapshot
+→ POSCTL một lần
 ```
 
-## Cấu trúc code
-
-```text
-include/adaptive_mission_mode/
-├── app/        # ROS node wiring, main loop, state JSON
-├── control/    # PX4 command, altitude offset, trajectory executor
-├── mission/    # mission model, parser
-└── runtime/    # PX4 MissionExecutor
-
-src/
-├── app/
-├── control/
-├── mission/
-└── runtime/
-```
-
-## Build
-
-```bash
-cd ~/mission-mode-executor-arch
-source /opt/ros/humble/setup.bash
-
-colcon build --symlink-install \
-  --packages-select px4_msgs px4_ros2_cpp adaptive_mission_mode
-
-source install/setup.bash
-```
-
-## Run
-
-```bash
-ros2 launch adaptive_mission_mode adaptive_mission_mode.launch.py
-```
-
-## Topic vào
+## Topic quan trọng
 
 ### Nạp mission
 
 ```bash
 ros2 topic pub --once /adaptive_mission_mode/mission_json std_msgs/msg/String \
-  "{data: '{\"version\":1,\"mission\":{\"items\":[{\"type\":\"takeoff\",\"altitude\":20.0},{\"type\":\"rtl\"}]}}'}"
+"{data: '{\"version\":1,\"mission\":{\"items\":[{\"type\":\"takeoff\"},{\"type\":\"rtl\"}]}}'}"
 ```
 
-Node cũng nghe mission từ:
+Hoặc chạy `fc_mission_reader` để publish:
 
 ```text
 /fc_mission_reader/mission_json
 ```
-
-Mission mới chỉ được cache. Mission chỉ load thật khi user chọn Adaptive Mission Mode.
 
 ### Reset mission/cache/snapshot
 
@@ -95,61 +64,34 @@ Mission mới chỉ được cache. Mission chỉ load thật khi user chọn Ad
 ros2 topic pub --once /adaptive_mission_mode/reset std_msgs/msg/Bool "{data: true}"
 ```
 
-Reset sẽ:
-
-```text
-abort executor
-xóa mission cache
-xóa runtime mission
-xóa snapshot
-xóa externalInterrupted
-chuyển PX4 về POSCTL
-```
-
-## Topic trạng thái
+### Xem state
 
 ```bash
 ros2 topic echo /adaptive_mission_mode/state
 ```
 
-Các trường quan trọng:
-
-```text
-state
-mission_cached
-mission_loaded
-mission_runtime_loaded
-mission_ready
-external_interrupted
-return_to_snapshot_active
-mission_control_blocked
-mission_snapshot
-current_index
-altitude_offset_m
-vehicle
-```
-
-## State chính
+State chính:
 
 ```text
 idle
+no_mission_standby
 mission_cached_wait_mode
-mission_loaded_on_mode_select
+loading_mission
 pre_takeoff
-mav_takeoff
-select_adaptive_after_takeoff
-mission
-external_interrupted_wait_mode
+wait_adaptive_activation
+running
+external_interrupted_wait_selection
+resume_takeoff
+wait_adaptive_activation_for_resume
 return_to_snapshot
-done
+completed
+error
 ```
 
-## Param mới
+## Build
 
-```yaml
-snapshot_return_acceptance_m: 1.5
-snapshot_return_horizontal_velocity: 3.0
-snapshot_return_vertical_velocity: 2.0
-snapshot_return_max_heading_rate: 60.0
-state_publish_period_s: 1.0
+```bash
+cd ~/mission-mode-executor-arch
+source /opt/ros/humble/setup.bash
+colcon build --symlink-install --packages-select adaptive_mission_mode
 ```

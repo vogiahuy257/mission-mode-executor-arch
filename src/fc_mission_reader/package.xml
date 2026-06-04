@@ -1,8 +1,8 @@
 <?xml version="1.0"?>
 <package format="3">
   <name>fc_mission_reader</name>
-  <version>0.2.0</version>
-  <description>ROS 2 C++ MAVLink passive mission observer. It reconstructs mission JSON by sniffing mission upload/download/clear traffic without sending MAVLink mission requests.</description>
+  <version>0.1.0</version>
+  <description>ROS 2 C++ node that downloads the full MAVLink mission stored in the flight controller and publishes/writes it as JSON.</description>
   <maintainer email="user@example.com">ghuy</maintainer>
   <license>BSD-3-Clause</license>
 

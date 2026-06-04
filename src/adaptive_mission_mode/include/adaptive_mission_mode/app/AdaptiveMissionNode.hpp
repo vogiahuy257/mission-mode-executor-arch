@@ -3,13 +3,12 @@
 #include <memory>
 #include <optional>
 #include <string>
-#include <vector>
+
+#include <Eigen/Eigen>
 
 #include <px4_msgs/msg/vehicle_command_ack.hpp>
 #include <px4_msgs/msg/vehicle_land_detected.hpp>
 #include <px4_msgs/msg/vehicle_status.hpp>
-
-#include <Eigen/Eigen>
 
 #include <px4_ros2/components/manual_control_input.hpp>
 #include <px4_ros2/control/setpoint_types/multicopter/goto.hpp>
@@ -24,7 +23,6 @@
 #include "adaptive_mission_mode/control/Px4CommandClient.hpp"
 #include "adaptive_mission_mode/mission/MissionModel.hpp"
 #include "adaptive_mission_mode/runtime/AdaptiveMissionExecutor.hpp"
-#include "adaptive_mission_mode/runtime/PauseResumeController.hpp"
 
 namespace adaptive_mission_mode
 {
@@ -35,6 +33,23 @@ public:
   explicit AdaptiveMissionNode(std::shared_ptr<rclcpp::Node> node);
 
 private:
+  enum class RuntimeState
+  {
+    Idle,
+    NoMissionStandby,
+    MissionCachedWaitMode,
+    LoadingMission,
+    PreTakeoff,
+    WaitAdaptiveActivation,
+    Running,
+    ExternalInterruptedWaitSelection,
+    ResumeTakeoff,
+    WaitAdaptiveActivationForResume,
+    ReturnToSnapshot,
+    Completed,
+    Error
+  };
+
   struct MissionSnapshot
   {
     bool valid{false};
@@ -42,15 +57,6 @@ private:
     int missionIndex{-1};
     float altitudeOffsetM{0.0F};
     std::string missionHash{};
-  };
-
-  enum class ResumeFlowState
-  {
-    None,
-    InterruptedWaitSelection,
-    ResumeTakeoff,
-    WaitAdaptiveActivation,
-    ReturnToSnapshot
   };
 
   void loadParameters();
@@ -63,6 +69,10 @@ private:
 
   void mainLoop();
 
+  void processRuntimeEvents();
+
+  void updateRuntimeState();
+
   void registerModeIfNeeded();
 
   void cacheMissionText(const std::string & text);
@@ -71,31 +81,11 @@ private:
 
   void clearMissionMemory(bool clearCachedMission);
 
-  void retryPendingMissionIfReady();
-
   void requestStart(bool enabled);
 
   void requestStop();
 
-  void requestPauseRtl();
-
-  void requestContinueMission();
-
   void requestReset();
-
-  void updatePauseResume();
-
-  void updateMissionSnapshot();
-
-  void beginReturnToSnapshot(const char * reason);
-
-  void updateReturnToSnapshot();
-
-  void settleExternalInterruptionIfNeeded();
-
-  bool saveResumeMission();
-
-  bool applyResumeMission();
 
   void handleVehicleStatus(const px4_msgs::msg::VehicleStatus & message);
 
@@ -103,11 +93,37 @@ private:
 
   void handleVehicleLandDetected(const px4_msgs::msg::VehicleLandDetected & message);
 
-  void beginPreTakeoff(const char * reason);
+  void updateMissionSnapshot();
 
   void updateAltitudeOffset();
 
   void updatePreTakeoff();
+
+  void updateWaitAdaptiveActivation();
+
+  void updateExternalInterruptedWaitSelection();
+
+  void updateReturnToSnapshot();
+
+  void enterState(RuntimeState nextState, const char * reason);
+
+  void enterPreTakeoff(const char * reason, std::optional<double> overrideAltitudeMsl = std::nullopt);
+
+  void enterReturnToSnapshot(const char * reason);
+
+  void handleMissionCompleted();
+
+  void sendArmThrottled();
+
+  void sendDisarmThrottled();
+
+  void sendTakeoffThrottled(double targetAltitudeMsl);
+
+  void sendAdaptiveModeThrottled();
+
+  void sendPosctlOnce();
+
+  void resetCommandTimers();
 
   void publishState();
 
@@ -115,19 +131,27 @@ private:
 
   bool fmuTopicsVisible() const;
 
-  bool needPreTakeoff() const;
-
-  bool shouldUseSnapshotTakeoff() const;
+  bool canAcceptNewMission() const;
 
   bool missionControlBlocked() const;
 
-  const char * resumeFlowStateName() const;
+  bool needPreTakeoff(double targetAltitudeMsl) const;
+
+  bool adaptiveModeSelected() const;
+
+  bool adaptiveModeRisingEdge() const;
+
+  bool adaptiveModeFallingEdge() const;
+
+  bool hasValidCurrentAltitude() const;
 
   double currentAltitudeMsl() const;
 
   double targetTakeoffAltitudeMsl() const;
 
-  nlohmann::json buildResumeStateJson() const;
+  double activePreTakeoffTargetAltitudeMsl() const;
+
+  const char * runtimeStateName() const;
 
   nlohmann::json buildMissionItemStateJson(int index) const;
 
@@ -155,8 +179,6 @@ private:
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr fcMissionSubscriber_{};
 
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr activateSubscriber_{};
-  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr pauseSubscriber_{};
-  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr continueSubscriber_{};
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr resetSubscriber_{};
 
   rclcpp::Subscription<px4_msgs::msg::VehicleStatus>::SharedPtr vehicleStatusSubscriber_{};
@@ -167,9 +189,11 @@ private:
 
   AltitudeOffsetController altitudeOffset_{};
 
-  PauseResumeController pauseResume_{};
-
   PlanInfo plan_{};
+
+  MissionSnapshot missionSnapshot_{};
+
+  RuntimeState state_{RuntimeState::Idle};
 
   std::string missionTopic_{};
   std::string fcMissionTopic_{};
@@ -177,77 +201,72 @@ private:
   std::string cachedMissionText_{};
   std::string cachedMissionKey_{};
 
-  std::string sourceMissionKey_{};
   std::string pendingMissionText_{};
   std::string pendingMissionKey_{};
 
-  bool pendingMission_{};
+  bool pendingMission_{false};
+  bool cachedMissionAvailable_{false};
+  bool missionLoaded_{false};
+  bool runtimeMissionLoaded_{false};
+  bool missionReady_{false};
+  bool missionFinished_{false};
+  bool resumeRequiresFreshAdaptiveSelection_{false};
+  bool externalLandingPosctlSent_{false};
+  bool externalLandingParked_{false};
 
-  std::string runtimeState_{"idle"};
+  bool modeRegistered_{false};
+  bool adaptiveModeActive_{false};
+  bool adaptiveSelectedLast_{false};
+  bool adaptiveSelectedNow_{false};
+  bool adaptiveRisingEdge_{false};
+  bool adaptiveFallingEdge_{false};
 
-  bool allowActivateTopicStart_{};
-  bool autoArm_{};
-  bool autoTakeoff_{};
-  bool publishFullItemList_{};
+  bool modeActivatedEvent_{false};
+  bool modeDeactivatedEvent_{false};
+  bool missionCompletedEvent_{false};
 
-  double takeoffAcceptanceM_{};
-  double snapshotReturnAcceptanceM_{};
-  float snapshotReturnHorizontalVelocity_{};
-  float snapshotReturnVerticalVelocity_{};
-  float snapshotReturnMaxHeadingRate_{};
-  double statePublishPeriodS_{};
+  bool allowActivateTopicStart_{false};
+  bool autoArm_{true};
+  bool autoTakeoff_{true};
+  bool publishFullItemList_{false};
+
+  bool armed_{false};
+  bool landed_{false};
+  bool failsafe_{false};
+
+  uint8_t navState_{0};
+  uint8_t userIntentNavState_{0};
+  uint8_t armingState_{0};
+  uint8_t executorInCharge_{0};
+
+  int currentMissionIndex_{-1};
+
+  double takeoffAcceptanceM_{0.7};
+  double snapshotReturnAcceptanceM_{1.5};
+  float snapshotReturnHorizontalVelocity_{3.0F};
+  float snapshotReturnVerticalVelocity_{2.0F};
+  float snapshotReturnMaxHeadingRate_{60.0F};
+  double statePublishPeriodS_{1.0};
 
   Px4CommandTarget commandTarget_{};
 
-  bool cachedMissionAvailable_{};
-  bool missionLoaded_{};
-  bool missionReady_{};
-  bool runtimeMissionLoaded_{};
-  bool modeRegistered_{};
-  bool active_{};
-  bool resumePending_{};
-  bool preTakeoffActive_{};
-  bool preTakeoffSent_{};
-  bool preModeSent_{};
-  bool missionFinished_{};
-  bool externalInterrupted_{};
-  bool returnToSnapshotActive_{};
-  bool noCachedMissionRejectActive_{};
-  bool lastAdaptiveNavActive_{};
-  bool externalInterruptionNeutralModeSent_{};
-
-  ResumeFlowState resumeFlowState_{ResumeFlowState::None};
-
-  bool armed_{};
-  bool landed_{};
-  bool failsafe_{};
-
-  uint8_t navState_{};
-  uint8_t userIntentNavState_{};
-  uint8_t armingState_{};
-  uint8_t executorInCharge_{};
-
-  int currentMissionIndex_{-1};
-  int resumeIndex_{};
-
-  float resumeAltitudeOffsetM_{};
-
-  nlohmann::json resumeMissionJson_{nlohmann::json::object()};
-  nlohmann::json resumeInfoJson_{nlohmann::json::object()};
-
-  MissionSnapshot missionSnapshot_{};
   std::optional<double> preTakeoffOverrideAltitudeMsl_{};
 
   rclcpp::Time lastRegisterLog_{};
   rclcpp::Time lastRegisterTry_{};
   rclcpp::Time lastAltitudeOffsetLog_{};
   rclcpp::Time lastArmCommand_{};
+  rclcpp::Time lastDisarmCommand_{};
   rclcpp::Time lastTakeoffCommand_{};
   rclcpp::Time lastModeCommand_{};
-  rclcpp::Time lastSelectWatchLog_{};
   rclcpp::Time lastStatePublish_{};
   rclcpp::Time lastSnapshotLog_{};
   rclcpp::Time lastReturnToSnapshotLog_{};
+  rclcpp::Time lastSelectLog_{};
+  rclcpp::Time lastNoMissionLog_{};
+  rclcpp::Time lastStateLog_{};
+
+  bool posctlSentForCurrentState_{false};
 };
 
 }  // namespace adaptive_mission_mode

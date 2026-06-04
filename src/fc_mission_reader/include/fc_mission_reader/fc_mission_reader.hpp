@@ -15,13 +15,14 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
 #include <vector>
 
 #include <rclcpp/rclcpp.hpp>
-#include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/string.hpp>
 
 namespace fc_mission_reader
@@ -36,7 +37,7 @@ struct MissionItem
   uint16_t command{0};
   uint8_t current{0};
   uint8_t autocontinue{0};
-  uint8_t mission_type{MAV_MISSION_TYPE_MISSION};
+  uint8_t mission_type{0};
   float p1{0.0F};
   float p2{0.0F};
   float p3{0.0F};
@@ -44,20 +45,6 @@ struct MissionItem
   double x{0.0};
   double y{0.0};
   float z{0.0F};
-};
-
-struct PassiveTransfer
-{
-  bool active{false};
-  bool upload_to_fc{false};
-  uint8_t peer_sysid{0};
-  uint8_t peer_compid{0};
-  uint16_t expected_count{0};
-  uint32_t opaque_id{0};
-  uint8_t mission_type{MAV_MISSION_TYPE_MISSION};
-  std::vector<std::optional<MissionItem>> items;
-  rclcpp::Time last_update{};
-  std::string reason;
 };
 
 class FcMissionReader : public rclcpp::Node
@@ -69,49 +56,29 @@ public:
 private:
   bool openSocket();
   void poll();
-  bool readDatagram(int timeout_ms);
-  void observeMessage(const mavlink_message_t & msg, const sockaddr_in & src);
+  void drainEvents(int timeout_ms);
+  void observeMessage(const mavlink_message_t & msg);
+  void requestMissionSync(const std::string & reason);
+  void handleEmptyMission(uint32_t opaque_id, const std::string & reason, bool publish_even_if_unchanged);
+  bool missionIdChanged() const;
+  bool readMissionInfo(uint16_t & count, uint32_t & opaque_id);
+  bool readMissionInfoFromCurrentEndpoint(uint16_t & count, uint32_t & opaque_id);
+  bool readMissionItems(uint16_t count, std::vector<MissionItem> & items);
+  bool readMission(std::vector<MissionItem> & items, uint16_t & count, uint32_t & opaque_id);
+  bool waitHeartbeat();
+  bool waitCount(uint16_t & count, uint32_t & opaque_id);
+  bool waitItem(uint16_t seq, MissionItem & item);
+  bool readMessage(mavlink_message_t & msg, int timeout_ms);
 
-  bool isFlightControllerHeartbeat(const mavlink_message_t & msg, mavlink_heartbeat_t & heartbeat) const;
-  bool isTargetFlightControllerMessage(const mavlink_message_t & msg) const;
-  bool isDirectedToFlightController(uint8_t target_system, uint8_t target_component) const;
-  bool isDirectedFromFlightController(const mavlink_message_t & msg) const;
-  bool missionTypeMatches(uint8_t mission_type) const;
-
-  void handleHeartbeat(const mavlink_message_t & msg);
-  void handleMissionCurrent(const mavlink_message_t & msg);
-  void handleMissionCount(const mavlink_message_t & msg);
-  void handleMissionItemInt(const mavlink_message_t & msg);
-  void handleMissionItem(const mavlink_message_t & msg);
-  void handleMissionClearAll(const mavlink_message_t & msg);
-  void handleMissionAck(const mavlink_message_t & msg);
-
-  void beginTransfer(
-    bool upload_to_fc,
-    uint8_t peer_sysid,
-    uint8_t peer_compid,
-    uint16_t expected_count,
-    uint32_t opaque_id,
-    const std::string & reason);
-  void resetTransfer(const std::string & reason);
-  bool transferMatches(const PassiveTransfer & transfer, const mavlink_message_t & msg) const;
-  void captureMissionItem(const MissionItem & item, const mavlink_message_t & msg);
-  bool transferComplete() const;
-  std::vector<MissionItem> completedTransferItems() const;
-  void finalizeTransfer(const std::string & reason, bool allow_reset);
-  void checkTransferTimeout();
-
-  void markPendingClear(const mavlink_message_t & msg, const std::string & reason);
-  void finalizeClear(uint32_t opaque_id, const std::string & reason);
-  void handleRemoteEmpty(const std::string & reason, bool allow_reset);
-  void handleUnknownRemoteMission(const std::string & reason, bool allow_reset);
+  void sendMessage(const mavlink_message_t & msg);
+  void rememberSender(const sockaddr_in & src, const mavlink_message_t & msg);
+  std::string addrText(const sockaddr_in & addr) const;
+  void sendRequestList();
+  void sendRequestItem(uint16_t seq);
+  void sendAck();
 
   std::string buildJson(
-    const std::vector<MissionItem> & items,
-    uint16_t count,
-    uint32_t opaque_id,
-    const std::string & status,
-    const std::string & note) const;
+    const std::vector<MissionItem> & items, uint16_t count, uint32_t opaque_id) const;
   std::string buildCustomMission(const std::vector<MissionItem> & items) const;
   std::string buildRawItems(const std::vector<MissionItem> & items) const;
   std::string convertItem(const MissionItem & item) const;
@@ -122,75 +89,65 @@ private:
   std::string defaultOutputFile() const;
 
   void loadCache();
-  void updateCache(
-    const std::string & json,
-    uint16_t count,
-    uint32_t opaque_id,
-    const std::string & hash,
-    const std::string & status);
-  void publishJsonIfChanged(
-    const std::string & json,
-    const std::string & signature,
-    const std::string & reason);
-  void publishResetIfNeeded(
-    const std::string & reason,
-    const std::string & signature,
-    bool allow_reset);
+  void updateCache(const std::string & json, uint16_t count, uint32_t opaque_id, const std::string & hash);
+  void publishJson(const std::string & json);
+  bool canPublishCachedMissionContinuously() const;
+  void publishCachedMissionContinuously();
   void saveJson(const std::string & json);
+  void publishAndSave(const std::string & json);
+  void publishFailure(const std::string & note);
+  bool shouldDownload(uint16_t count, uint32_t opaque_id) const;
+  bool shouldInitialDownload() const;
+  bool shouldPollMissionInfo() const;
   std::string extractString(const std::string & json, const std::string & key) const;
   std::optional<uint64_t> extractNumber(const std::string & json, const std::string & key) const;
 
   std::string bind_ip_;
+  std::string target_ip_;
   std::string output_file_;
   int bind_port_{14551};
-  double poll_period_s_{0.02};
-  int read_budget_ms_{50};
-  double transfer_timeout_s_{8.0};
-  bool publish_reset_on_mission_change_{true};
-  bool publish_reset_on_startup_change_{false};
-  double reset_publish_min_interval_s_{1.0};
-  std::string adaptive_reset_topic_{"/adaptive_mission_mode/reset"};
-  bool publish_unknown_on_remote_change_{true};
-  bool publish_empty_from_mission_current_{true};
+  int target_port_{14550};
+  int timeout_ms_{3000};
+  int retries_{3};
+  double poll_period_s_{3.0};
+  double fallback_count_poll_s_{60.0};
+  bool enable_fallback_count_poll_{false};
+  bool publish_cached_mission_continuously_{true};
 
   int sock_{-1};
+  sockaddr_in target_addr_{};
   uint8_t own_sysid_{250};
   uint8_t own_compid_{190};
   uint8_t target_sysid_{1};
   uint8_t target_compid_{1};
   uint8_t mission_type_{MAV_MISSION_TYPE_MISSION};
 
-  bool has_fc_heartbeat_{false};
-  rclcpp::Time last_fc_heartbeat_{};
-  sockaddr_in last_fc_addr_{};
-
-  bool remote_mission_id_valid_{false};
+  bool busy_{false};
+  bool force_download_{false};
+  bool initial_sync_done_{false};
+  bool remote_reported_empty_{false};
   uint32_t remote_mission_id_{0};
-  bool remote_total_valid_{false};
+  bool remote_mission_id_valid_{false};
   uint16_t remote_total_{0};
+  bool remote_total_valid_{false};
   bool mission_current_total_supported_{false};
-  bool startup_phase_{true};
-
-  PassiveTransfer transfer_;
-  bool pending_clear_{false};
-  uint8_t pending_clear_peer_sysid_{0};
-  uint8_t pending_clear_peer_compid_{0};
-  rclcpp::Time pending_clear_time_{};
-
+  std::string sync_reason_{"startup"};
+  rclcpp::Time last_count_poll_{};
   bool has_cache_{false};
   uint16_t cached_count_{0};
   uint32_t cached_opaque_id_{0};
   std::string cached_hash_;
   std::string cached_json_;
-  std::string cached_status_;
-
-  std::string last_published_signature_;
-  std::string last_reset_signature_;
-  rclcpp::Time last_reset_publish_{};
-
+  rclcpp::Time last_full_download_{};
+  bool auto_target_{true};
+  bool has_learned_target_{false};
+  sockaddr_in learned_addr_{};
+  bool has_observed_peer_{false};
+  bool prefer_observed_peer_for_requests_{false};
+  sockaddr_in observed_peer_addr_{};
+  bool startup_failure_published_{false};
   rclcpp::TimerBase::SharedPtr timer_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr pub_;
-  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr reset_pub_;
 };
 
 }  // namespace fc_mission_reader

@@ -29,10 +29,7 @@ add_executable(adaptive_mission_mode_node
   src/control/Px4CommandClient.cpp
 
   src/mission/MissionParser.cpp
-  src/mission/ResumeMissionBuilder.cpp
-
   src/runtime/AdaptiveMissionExecutor.cpp
-  src/runtime/PauseResumeController.cpp
 )
 
 target_include_directories(adaptive_mission_mode_node
