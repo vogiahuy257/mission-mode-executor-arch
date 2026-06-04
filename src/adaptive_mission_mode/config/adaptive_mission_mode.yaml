@@ -1,0 +1,25 @@
+adaptive_mission_mode:
+  ros__parameters:
+    mission_topic: "~/mission_json"
+    fc_mission_topic: "/fc_mission_reader/mission_json"
+
+    allow_activate_topic_start: false
+    auto_arm_on_activate: true
+    auto_takeoff_on_activate: true
+
+    publish_full_item_list: false
+    takeoff_acceptance_m: 0.7
+
+    # Return-to-snapshot khi user chuyển mode khác giữa mission rồi chọn lại Adaptive Mission Mode.
+    snapshot_return_acceptance_m: 1.5
+    snapshot_return_horizontal_velocity: 3.0
+    snapshot_return_vertical_velocity: 2.0
+    snapshot_return_max_heading_rate: 60.0
+
+    # Publish state định kỳ trong main loop.
+    state_publish_period_s: 1.0
+
+    target_system: 1
+    target_component: 1
+    source_system: 1
+    source_component: 1

@@ -498,10 +498,29 @@ function decodePx4Mode(customMode) {
 function getLivePosition(status) {
   const mavlink = status?.mavlink ?? {};
   const rosPosition = status?.vehicle?.position ?? {};
+  const runtimeVehicle = status?.mission_runtime?.vehicle ?? status?.vehicle?.runtime_vehicle ?? {};
 
-  const mavLocalX = mavlink.local_x_ned_m ?? rosPosition.local_x_ned_m ?? null;
-  const mavLocalY = mavlink.local_y_ned_m ?? rosPosition.local_y_ned_m ?? null;
-  const mavLocalZ = mavlink.local_z_ned_m ?? rosPosition.local_z_ned_m ?? null;
+  const runtimeLatitude = firstFiniteNumber(runtimeVehicle.lat, runtimeVehicle.latitude_deg, runtimeVehicle.latitude);
+  const runtimeLongitude = firstFiniteNumber(runtimeVehicle.lon, runtimeVehicle.longitude_deg, runtimeVehicle.longitude);
+  const runtimeAltitudeAmsl = firstFiniteNumber(runtimeVehicle.alt_msl, runtimeVehicle.altitude_amsl_m, runtimeVehicle.alt_msl_m);
+
+  // Drone UI/map must prefer the global state published by adaptive_mission_mode:
+  // lat, lon, alt_msl. Local NED is kept only as a debug/fallback field.
+  if (hasValidCoordinate(runtimeLatitude, runtimeLongitude)) {
+    return {
+      latitude_deg: runtimeLatitude,
+      longitude_deg: runtimeLongitude,
+      altitude_amsl_m: runtimeAltitudeAmsl ?? rosPosition.altitude_amsl_m ?? mavlink.altitude_amsl_m ?? null,
+      relative_altitude_m: rosPosition.relative_altitude_m ?? mavlink.relative_altitude_m ?? null,
+      local_x_ned_m: runtimeVehicle.x_ned_m ?? rosPosition.local_x_ned_m ?? mavlink.local_x_ned_m ?? null,
+      local_y_ned_m: runtimeVehicle.y_ned_m ?? rosPosition.local_y_ned_m ?? mavlink.local_y_ned_m ?? null,
+      local_z_ned_m: runtimeVehicle.z_ned_m ?? rosPosition.local_z_ned_m ?? mavlink.local_z_ned_m ?? null,
+      ref_lat_deg: runtimeVehicle.ref_lat_deg ?? rosPosition.ref_lat_deg ?? null,
+      ref_lon_deg: runtimeVehicle.ref_lon_deg ?? rosPosition.ref_lon_deg ?? null,
+      ref_alt_msl_m: runtimeVehicle.ref_alt_msl_m ?? rosPosition.ref_alt_msl_m ?? null,
+      source: "adaptive state lat/lon/AMSL",
+    };
+  }
 
   if (hasValidCoordinate(rosPosition.latitude_deg, rosPosition.longitude_deg)) {
     return {
@@ -511,7 +530,7 @@ function getLivePosition(status) {
       local_x_ned_m: rosPosition.local_x_ned_m ?? mavlink.local_x_ned_m ?? null,
       local_y_ned_m: rosPosition.local_y_ned_m ?? mavlink.local_y_ned_m ?? null,
       local_z_ned_m: rosPosition.local_z_ned_m ?? mavlink.local_z_ned_m ?? null,
-      source: rosPosition.source ?? "ROS 2",
+      source: rosPosition.source ?? "PX4 global_position lat/lon/AMSL",
     };
   }
 
@@ -521,12 +540,12 @@ function getLivePosition(status) {
       longitude_deg: mavlink.longitude_deg,
       altitude_amsl_m: mavlink.altitude_amsl_m,
       relative_altitude_m: mavlink.relative_altitude_m,
-      local_x_ned_m: mavLocalX,
-      local_y_ned_m: mavLocalY,
-      local_z_ned_m: mavLocalZ,
+      local_x_ned_m: mavlink.local_x_ned_m ?? rosPosition.local_x_ned_m ?? null,
+      local_y_ned_m: mavlink.local_y_ned_m ?? rosPosition.local_y_ned_m ?? null,
+      local_z_ned_m: mavlink.local_z_ned_m ?? rosPosition.local_z_ned_m ?? null,
       ref_lat_deg: rosPosition.ref_lat_deg ?? null,
       ref_lon_deg: rosPosition.ref_lon_deg ?? null,
-      source: "MAVLink",
+      source: "MAVLink lat/lon/AMSL",
     };
   }
 
@@ -538,16 +557,21 @@ function getLivePosition(status) {
   );
   if (localCoordinate) {
     const localZ = rosPosition.local_z_ned_m ?? mavlink.local_z_ned_m ?? null;
+    const refAltMsl = firstFiniteNumber(rosPosition.ref_alt_msl_m, mavlink.global_origin_alt_msl_m);
+    const fallbackAmsl = Number.isFinite(Number(localZ)) && Number.isFinite(Number(refAltMsl))
+      ? Number(refAltMsl) - Number(localZ)
+      : null;
     return {
       ...localCoordinate,
-      altitude_amsl_m: null,
+      altitude_amsl_m: fallbackAmsl,
       relative_altitude_m: Number.isFinite(Number(localZ)) ? -Number(localZ) : null,
       local_x_ned_m: rosPosition.local_x_ned_m ?? mavlink.local_x_ned_m ?? null,
       local_y_ned_m: rosPosition.local_y_ned_m ?? mavlink.local_y_ned_m ?? null,
       local_z_ned_m: localZ,
       ref_lat_deg: rosPosition.ref_lat_deg ?? DEFAULT_MAP_CENTER.latitude_deg,
       ref_lon_deg: rosPosition.ref_lon_deg ?? DEFAULT_MAP_CENTER.longitude_deg,
-      source: rosPosition.ref_lat_deg && rosPosition.ref_lon_deg ? "ROS 2 local NED" : "Local NED map-origin fallback",
+      ref_alt_msl_m: refAltMsl,
+      source: rosPosition.ref_lat_deg && rosPosition.ref_lon_deg ? "local NED fallback -> lat/lon/AMSL" : "map-origin fallback -> lat/lon",
     };
   }
 
@@ -870,6 +894,15 @@ function formatSmallNumber(value, digits = 2, suffix = "") {
   return `${Number(value).toFixed(digits)}${suffix}`;
 }
 
+function firstFiniteNumber(...values) {
+  for (const value of values) {
+    if (value !== null && value !== undefined && value !== "" && Number.isFinite(Number(value))) {
+      return Number(value);
+    }
+  }
+  return null;
+}
+
 function formatLinkSummary(value) {
   if (!value) {
     return "--";
@@ -986,8 +1019,9 @@ function getBaseVisualAltitudeM(item, livePosition) {
   if (Number.isFinite(Number(item?.altitude_m))) {
     return Math.max(0, Number(item.altitude_m));
   }
-  if (Number.isFinite(Number(livePosition?.relative_altitude_m))) {
-    return Math.max(0, Number(livePosition.relative_altitude_m));
+  const droneAmslM = firstFiniteNumber(livePosition?.altitude_amsl_m, livePosition?.alt_msl);
+  if (droneAmslM !== null) {
+    return Math.max(0, droneAmslM);
   }
   return 0;
 }
@@ -998,6 +1032,21 @@ function getVisualAltitudeM(item, livePosition, missionAltitudeOffsetM = 0) {
     return Math.max(0, baseAltitudeM + Number(missionAltitudeOffsetM));
   }
   return baseAltitudeM;
+}
+
+function getDroneDisplayAltitudeM(livePosition) {
+  const altitudeAmslM = firstFiniteNumber(livePosition?.altitude_amsl_m, livePosition?.alt_msl);
+  if (altitudeAmslM !== null) {
+    return altitudeAmslM;
+  }
+
+  // Last-resort fallback only when no global AMSL is available.
+  const relativeAltitudeM = firstFiniteNumber(livePosition?.relative_altitude_m);
+  if (relativeAltitudeM !== null) {
+    return relativeAltitudeM;
+  }
+  const localZM = firstFiniteNumber(livePosition?.local_z_ned_m);
+  return localZM !== null ? -localZM : 0;
 }
 
 function formatAltitudeLabel(value) {
@@ -1028,8 +1077,9 @@ function getTakeoffAltitude(missionItems, status) {
   }
 
   const livePosition = getLivePosition(status ?? EMPTY_STATUS);
-  if (Number.isFinite(Number(livePosition.relative_altitude_m)) && Number(livePosition.relative_altitude_m) > 0.5) {
-    return Number(livePosition.relative_altitude_m);
+  const liveAmslM = firstFiniteNumber(livePosition.altitude_amsl_m, livePosition.alt_msl);
+  if (liveAmslM !== null) {
+    return liveAmslM;
   }
   return 20;
 }
@@ -2362,7 +2412,7 @@ const MissionMap = memo(function MissionMap({
       .filter((point) => hasValidCoordinate(point.latitude_deg, point.longitude_deg))
       .map((point) => {
         const local = coordinateToSceneMeters(point, currentBaseCoordinateRef.current);
-        const altitudeM = Number.isFinite(Number(point.relative_altitude_m)) ? Math.max(0.65, Number(point.relative_altitude_m)) : 0.65;
+        const altitudeM = Math.max(0.65, firstFiniteNumber(point.altitude_amsl_m, point.relative_altitude_m) ?? 0.65);
         return new THREE.Vector3(local.x, altitudeM, local.z);
       });
 
@@ -2391,9 +2441,7 @@ const MissionMap = memo(function MissionMap({
     }
 
     const local = coordinateToSceneMeters(livePosition, currentBaseCoordinateRef.current);
-    const altitudeM = Number.isFinite(Number(livePosition.relative_altitude_m))
-      ? Math.max(0.65, Number(livePosition.relative_altitude_m))
-      : 0.65;
+    const altitudeM = Math.max(0.65, getDroneDisplayAltitudeM(livePosition));
     const headingDeg = Number.isFinite(Number(droneTelemetry.headingDeg)) ? Number(droneTelemetry.headingDeg) : 0;
 
     droneVisual.visible = true;
@@ -2474,7 +2522,7 @@ const MissionMap = memo(function MissionMap({
     const points = [...markerPositionsRef.current];
     if (hasLivePosition) {
       const local = coordinateToSceneMeters(livePosition, currentBaseCoordinateRef.current);
-      points.push({ x: local.x, y: Number(livePosition.relative_altitude_m) || 0, z: local.z });
+      points.push({ x: local.x, y: getDroneDisplayAltitudeM(livePosition), z: local.z });
     }
     if (points.length === 0) {
       resetThreeCamera();
@@ -2738,7 +2786,7 @@ const MissionMap = memo(function MissionMap({
           Lat {formatCoordinate(livePosition.latitude_deg)} · Lon {formatCoordinate(livePosition.longitude_deg)}
         </div>
         <div className="font-mono text-zinc-400">
-          X {formatSmallNumber(livePosition.local_x_ned_m, 2, " m")} · Y {formatSmallNumber(livePosition.local_y_ned_m, 2, " m")} · Z {formatSmallNumber(livePosition.local_z_ned_m, 2, " m")}
+          AMSL {formatSmallNumber(livePosition.altitude_amsl_m, 2, " m")}
         </div>
       </div>
       {hasActiveMapPick ? (
@@ -2828,7 +2876,7 @@ function MissionItemRow({
               <Icon name="drag_indicator" className="text-[16px]" />
               <span>{item.type.toUpperCase()}</span>
               {hasMapCoordinate ? <span className="truncate">· {formatCoordinate(item.latitude_deg)}, {formatCoordinate(item.longitude_deg)}</span> : null}
-              {isTakeoff ? <span className="truncate">· target {formatAltitudeLabel(item.altitude_m)} AGL</span> : null}
+              {isTakeoff ? <span className="truncate">· target {formatAltitudeLabel(item.altitude_m)} AMSL</span> : null}
               {isHold ? <span className="truncate">· {formatHoldTimeLabel(item.hold_time_s)} sau WP trước</span> : null}
               {isLand ? <span className="truncate">· gắn dưới WP trước</span> : null}
               {isPickup ? <span className="truncate">· payload {item.custom_json || "{}"}</span> : null}
@@ -2868,11 +2916,11 @@ function MissionItemRow({
 
           {isTakeoff ? (
             <>
-              <Field label="Target Altitude (m AGL)">
+              <Field label="Target Altitude (m AMSL)">
                 <input value={item.altitude_m} onChange={(event) => onChange(index, "altitude_m", event.target.value)} className={compactInputClass} />
               </Field>
               <div className="rounded-2xl border border-emerald-300/20 bg-emerald-400/10 px-3 py-3 text-xs font-semibold text-emerald-100">
-                Takeoff dùng độ cao tương đối so với home và chạy qua PX4 takeoff mode.
+                Takeoff hiển thị/điều chỉnh theo độ cao AMSL trên UI; payload takeoff vẫn tối giản theo mode ROS.
               </div>
             </>
           ) : hasMapCoordinate ? (
@@ -2885,7 +2933,7 @@ function MissionItemRow({
                   <input value={item.longitude_deg} onChange={(event) => onChange(index, "longitude_deg", event.target.value)} className={compactInputClass} />
                 </Field>
               </div>
-              <Field label="Relative Alt (m AGL)">
+              <Field label="Altitude (m AMSL)">
                 <input value={item.altitude_m} onChange={(event) => onChange(index, "altitude_m", event.target.value)} className={compactInputClass} />
               </Field>
               <div className="grid grid-cols-2 gap-2">
@@ -3298,7 +3346,7 @@ function DroneStatusPanel({
 
         <div className="mt-3 grid grid-cols-2 gap-3">
           <DroneStatCard icon="explore" value={drone.headingDeg == null ? "--" : `${Number(drone.headingDeg).toFixed(0)}°`} caption="Heading" tone="cyan" />
-          <DroneStatCard icon="height" value={formatSmallNumber(livePositionForStatus.relative_altitude_m ?? (Number.isFinite(Number(livePositionForStatus.local_z_ned_m)) ? -Number(livePositionForStatus.local_z_ned_m) : livePositionForStatus.altitude_amsl_m), 2, " m")} caption="Altitude" tone="zinc" />
+          <DroneStatCard icon="height" value={formatSmallNumber(livePositionForStatus.altitude_amsl_m, 2, " m")} caption="AMSL" tone="zinc" />
           <DroneStatCard icon="schedule" value={formatAge(drone.heartbeatAge)} caption="Heartbeat" tone="zinc" />
         </div>
 
@@ -3314,9 +3362,6 @@ function DroneStatusPanel({
             <div className="flex justify-between gap-3"><span className="text-zinc-500">Lat</span><span>{formatCoordinate(livePositionForStatus.latitude_deg)}</span></div>
             <div className="flex justify-between gap-3"><span className="text-zinc-500">Lon</span><span>{formatCoordinate(livePositionForStatus.longitude_deg)}</span></div>
             <div className="flex justify-between gap-3"><span className="text-zinc-500">AMSL</span><span>{formatSmallNumber(livePositionForStatus.altitude_amsl_m, 2, " m")}</span></div>
-            <div className="flex justify-between gap-3"><span className="text-zinc-500">Local X</span><span>{formatSmallNumber(livePositionForStatus.local_x_ned_m, 2, " m")}</span></div>
-            <div className="flex justify-between gap-3"><span className="text-zinc-500">Local Y</span><span>{formatSmallNumber(livePositionForStatus.local_y_ned_m, 2, " m")}</span></div>
-            <div className="flex justify-between gap-3"><span className="text-zinc-500">Local Z</span><span>{formatSmallNumber(livePositionForStatus.local_z_ned_m, 2, " m")}</span></div>
           </div>
         </section>
 
@@ -3361,13 +3406,12 @@ function DroneStatusPanel({
             <div className="rounded-2xl bg-zinc-950/55 p-2"><p className="text-zinc-500">Landed</p><strong>{status.mission_runtime?.vehicle?.landed ? "YES" : "NO"}</strong></div>
           </div>
           <div className="mt-3 rounded-2xl border border-white/10 bg-zinc-950/55 px-3 py-3 text-xs">
-            <p className="text-zinc-500">Local NED</p>
+            <p className="text-zinc-500">State vehicle coordinate</p>
             <p className="mt-1 font-semibold text-zinc-100">
-              X {formatSmallNumber(status.mission_runtime?.vehicle?.x_ned_m, 2, " m")} · Y {formatSmallNumber(status.mission_runtime?.vehicle?.y_ned_m, 2, " m")} · Z {formatSmallNumber(status.mission_runtime?.vehicle?.z_ned_m, 2, " m")}
+              Lat {formatCoordinate(status.mission_runtime?.vehicle?.lat ?? status.mission_runtime?.vehicle?.latitude_deg)} · Lon {formatCoordinate(status.mission_runtime?.vehicle?.lon ?? status.mission_runtime?.vehicle?.longitude_deg)}
             </p>
-            <p className="mt-2 text-zinc-500">Local Reference</p>
             <p className="mt-1 font-semibold text-zinc-100">
-              {status.mission_runtime?.vehicle?.local_reference_valid ? "VALID" : "INVALID"} · Lat {formatCoordinate(status.mission_runtime?.vehicle?.ref_lat_deg)} · Lon {formatCoordinate(status.mission_runtime?.vehicle?.ref_lon_deg)} · AMSL {formatSmallNumber(status.mission_runtime?.vehicle?.ref_alt_msl_m, 2, " m")}
+              AMSL {formatSmallNumber(status.mission_runtime?.vehicle?.alt_msl ?? status.mission_runtime?.vehicle?.altitude_amsl_m, 2, " m")}
             </p>
             {status.mission_runtime?.last_error ? <p className="mt-2 text-rose-200">{status.mission_runtime.last_error}</p> : null}
           </div>

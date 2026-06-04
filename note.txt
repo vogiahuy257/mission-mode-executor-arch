@@ -32,3 +32,8 @@ run only auto arm + takeoff + mission complete test:
 
 ./build/adaptive_mission_mode/adaptive_mission_mode_unit_tests \
   --gtest_filter=MissionLifecycleManagerTest.AutoArmTakeoffAndCompletesRtlMissionFromGround
+
+
+setup can co de doc mission
+sudo apt update
+sudo apt install ros-humble-mavlink

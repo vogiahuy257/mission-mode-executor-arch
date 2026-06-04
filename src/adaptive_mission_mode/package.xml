@@ -2,8 +2,9 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>adaptive_mission_mode</name>
-  <version>0.1.0</version>
-  <description>Minimal PX4 ROS 2 adaptive mission mode controlled by JSON and activate topics.</description>
+  <version>0.3.0</version>
+  <description>Clean PX4 ROS 2 adaptive mission mode using fc_mission_reader/MAVLink raw mission JSON.</description>
+
   <maintainer email="user@example.com">User</maintainer>
   <license>BSD-3-Clause</license>
 
@@ -17,9 +18,6 @@
 
   <build_depend>eigen</build_depend>
   <build_export_depend>eigen</build_export_depend>
-
-  <test_depend>ament_lint_auto</test_depend>
-  <test_depend>ament_lint_common</test_depend>
 
   <export>
     <build_type>ament_cmake</build_type>

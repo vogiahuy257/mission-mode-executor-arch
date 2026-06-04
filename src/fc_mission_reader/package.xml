@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>fc_mission_reader</name>
+  <version>0.2.0</version>
+  <description>ROS 2 C++ MAVLink passive mission observer. It reconstructs mission JSON by sniffing mission upload/download/clear traffic without sending MAVLink mission requests.</description>
+  <maintainer email="user@example.com">ghuy</maintainer>
+  <license>BSD-3-Clause</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>std_msgs</depend>
+  <depend>ament_index_cpp</depend>
+  <depend>mavlink</depend>
+
+  <exec_depend>ros2launch</exec_depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
